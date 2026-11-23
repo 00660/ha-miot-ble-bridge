@@ -363,14 +363,17 @@ class MiotProtocol:
         package_type, payload = complete
         if self._state == "register_key" and len(payload) == 64:
             self._register_key(payload)
-        elif self._state == "register_cloud" and len(payload) == 92:
-            self._register_did(payload)
-        elif self._state == "register_cloud" and len(payload) in (24, 163):
+        elif self._state == "register_cloud" and (
+            (package_type == 0x07 and 1 <= len(payload) <= MAX_FRAME_SIZE)
+            or (package_type == 0x00 and len(payload) in (24, 163))
+        ):
             # The phone can wait for this receipt before sending its cloud DID.
             if not self._certificate_received:
                 self._certificate_received = True
                 self._result(0x11)
             self._finish_registration()
+        elif self._state == "register_cloud" and len(payload) == 92:
+            self._register_did(payload)
         elif self._state == "login_random" and package_type == 0x0B and len(payload) == 16:
             self._login_random(payload, now)
         elif self._state == "login_confirm" and package_type == 0x0A:

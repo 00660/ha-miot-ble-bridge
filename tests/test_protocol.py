@@ -59,8 +59,9 @@ def decode_parcels(notifications, channel=0x0019):
     return results
 
 
-def establish_login(device, now=0.0):
-    device.connect(now)
+def establish_login(device, now=0.0, *, connect=True):
+    if connect:
+        device.connect(now)
     device.write(0x0010, b"\x24\x00\x00\x00", now)
     app_random = bytes(range(0xA0, 0xB0))
     deliver_parcel(device, 0x0B, app_random, now=now)
@@ -207,6 +208,13 @@ class RegistrationTests(unittest.TestCase):
         encrypted = AESCCM(setup[28:44], tag_length=4).encrypt(bytes(range(0x10, 0x1C)), plaintext, b"devID")
         deliver_parcel(self.device, 6, encrypted)
 
+    def send_observed_cloud_certificate(self):
+        # Real trace: pkg 7, 22 fragments, 21 * 18 bytes plus one final byte.
+        self.device.write(0x0019, bytes.fromhex("000000071600"), 0.2)
+        for number in range(1, 22):
+            self.device.write(0x0019, struct.pack("<H", number) + bytes(18), 0.2)
+        self.device.write(0x0019, bytes.fromhex("160000"), 0.2)
+
     def test_a4_and_channel_initialization(self):
         self.device.write(0x0010, b"\xa4", 0.0)
         self.assertEqual(self.device.drain_notifications(), [(0x0019, bytes.fromhex("000004000612"))])
@@ -284,6 +292,92 @@ class RegistrationTests(unittest.TestCase):
         deliver_parcel(self.device, 7, bytes(163))
         results = [packet for channel, packet in self.device.drain_notifications() if channel == 0x0010]
         self.assertEqual(results, [])
+
+    def test_observed_379_byte_certificate_after_saved_did_and_then_login(self):
+        setup = self.start_registration()
+        self.send_cloud_identity(setup)
+        self.device.commit_identity(self.device.pending_identity)
+        self.device.drain_notifications()
+        self.assertTrue(self.device.bound)
+        self.device.write(0x0019, bytes.fromhex("000000071600"), 0.2)
+        self.assertEqual(self.device.drain_notifications(), [(0x0019, bytes.fromhex("00000101"))])
+        for number in range(1, 22):
+            frame = struct.pack("<H", number) + bytes(18)
+            self.assertEqual(len(frame), 20)
+            self.device.write(0x0019, frame, 0.2)
+            self.assertEqual(self.device.drain_notifications(), [])
+        final_frame = bytes.fromhex("160000")
+        self.assertEqual(len(final_frame), 3)
+        self.device.write(0x0019, final_frame, 0.2)
+        self.assertEqual(
+            self.device.drain_notifications(),
+            [(0x0019, bytes.fromhex("00000100")), (0x0010, bytes.fromhex("11000000"))],
+        )
+        self.send_observed_cloud_certificate()
+        self.assertTrue(all(channel == 0x0019 for channel, _ in self.device.drain_notifications()))
+        establish_login(self.device, now=0.3, connect=False)
+        self.assertTrue(self.device.logged_in)
+
+    def test_observed_379_byte_certificate_before_did_and_then_login(self):
+        setup = self.start_registration()
+        self.send_observed_cloud_certificate()
+        self.assertIn((0x0010, bytes.fromhex("11000000")), self.device.drain_notifications())
+        self.assertFalse(self.device.bound)
+        self.assertIsNone(self.device.pending_identity)
+        self.device.write(0x0010, bytes.fromhex("13000000"), 0.3)
+        self.assertFalse(self.device.bound)
+        self.send_cloud_identity(setup)
+        self.assertFalse(self.device.bound)
+        self.device.commit_identity(self.device.pending_identity)
+        self.assertTrue(self.device.bound)
+        self.assertTrue(all(channel == 0x0019 for channel, _ in self.device.drain_notifications()))
+        establish_login(self.device, now=0.4, connect=False)
+        self.assertTrue(self.device.logged_in)
+
+    def test_legacy_channel_certificate_lengths_are_preserved(self):
+        for size in (24, 163):
+            with self.subTest(size=size):
+                self.setUp()
+                self.start_registration()
+                deliver_parcel(self.device, 0, bytes(size))
+                results = [packet for channel, packet in self.device.drain_notifications() if channel == 0x0010]
+                self.assertEqual(results, [bytes.fromhex("11000000")])
+                self.assertFalse(self.device.bound)
+
+    def test_wrong_package_cannot_impersonate_certificate_by_length(self):
+        for package_type, size in ((0, 379), (3, 24), (3, 163), (5, 24), (6, 163), (6, 379)):
+            with self.subTest(package_type=package_type, size=size):
+                self.setUp()
+                self.start_registration()
+                deliver_parcel(self.device, package_type, bytes(size))
+                self.assertTrue(all(channel == 0x0019 for channel, _ in self.device.drain_notifications()))
+                self.assertFalse(self.device.bound)
+                self.assertIsNone(self.device.pending_identity)
+
+    def test_certificate_payload_is_nonempty_and_bounded(self):
+        for size in (0, 1, 92, 512, 513):
+            with self.subTest(size=size):
+                self.setUp()
+                self.start_registration()
+                if size == 0:
+                    self.device.write(0x0019, bytes.fromhex("00000207"), 0.2)
+                else:
+                    deliver_parcel(self.device, 7, bytes(size))
+                results = [packet for channel, packet in self.device.drain_notifications() if channel == 0x0010]
+                self.assertEqual(results, [bytes.fromhex("11000000")] if 1 <= size <= 512 else [])
+                self.assertFalse(self.device.bound)
+                self.assertIsNone(self.device.pending_identity)
+
+    def test_incomplete_379_byte_certificate_is_not_acknowledged(self):
+        self.start_registration()
+        self.device.write(0x0019, bytes.fromhex("000000071600"), 0.2)
+        self.device.drain_notifications()
+        for number in range(1, 22):
+            if number != 10:
+                self.device.write(0x0019, struct.pack("<H", number) + bytes(18), 0.2)
+        self.device.write(0x0019, bytes.fromhex("160000"), 0.2)
+        self.assertEqual(self.device.drain_notifications(), [])
+        self.assertFalse(self.device.bound)
 
     def test_certificate_without_authenticated_did_cannot_bind(self):
         self.start_registration()
