@@ -1,0 +1,22 @@
+"""Constants for the HA MiOT BLE Bridge integration."""
+
+DOMAIN = "miot_ble_bridge"
+MODEL = "xiaomi.sensor_occupy.03"
+PRODUCT_ID = 0x4683
+MANUFACTURER = "HA MiOT BLE Bridge"
+
+CONF_NAME = "name"
+CONF_SOURCE_DEVICE = "source_device_id"
+CONF_PRESENCE_ENTITY = "presence_entity"
+CONF_ILLUMINANCE_ENTITY = "illuminance_entity"
+CONF_PRESENCE_ENTITY_REGISTRY_ID = "presence_entity_registry_id"
+CONF_ILLUMINANCE_ENTITY_REGISTRY_ID = "illuminance_entity_registry_id"
+CONF_ADAPTER = "adapter"
+CONF_UNIQUE_ID = "unique_id"
+DEFAULT_ADAPTER = "hci0"
+
+STATUS_UNPAIRED = "未配对"
+STATUS_PAIRING = "配对中"
+STATUS_BOUND = "已绑定"
+STATUS_SOURCE_OFFLINE = "来源离线"
+STATUS_BLUETOOTH_UNAVAILABLE = "蓝牙不可用"

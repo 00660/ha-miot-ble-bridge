@@ -1,0 +1,74 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "选择要桥接的 HA 设备",
+        "description": "当前支持米家人体存在传感器协议。先选择包含存在实体的 HA 设备，每个雷达单独添加一次。",
+        "data": {
+          "source_device_id": "HA 设备"
+        }
+      },
+      "mapping": {
+        "title": "配置存在传感器转发",
+        "description": "为 {device} 选择存在与光照实体。默认优选整体存在状态。没有光照实体时，米家光照固定为 0 lx。",
+        "data": {
+          "name": "名称",
+          "presence_entity": "存在实体",
+          "illuminance_entity": "光照实体（可选）",
+          "adapter": "主机蓝牙适配器"
+        },
+        "data_description": {
+          "name": "留空时使用存在实体的名称。",
+          "illuminance_entity": "留空不会在 HA 中创建虚拟光照实体。",
+          "adapter": "当前主机使用 hci0。"
+        }
+      }
+    },
+    "error": {
+      "entity_not_found": "找不到所选实体。已登记的离线实体可以使用。",
+      "invalid_presence_entity": "存在来源必须是 binary_sensor 实体。",
+      "invalid_illuminance_entity": "光照来源必须是 sensor 实体。",
+      "entity_already_mapped": "该存在实体已经添加了米家转发。",
+      "invalid_adapter": "请输入主机适配器名称，例如 hci0。",
+      "invalid_name": "名称必须是文本。",
+      "device_not_found": "找不到所选 HA 设备。",
+      "no_presence_entities": "该设备没有 binary_sensor 来源；当前版本仅支持人体存在协议。",
+      "wrong_device": "请选择刚才所选设备中的来源实体。"
+    },
+    "abort": {
+      "already_configured": "这个雷达已经配置了米家转发。",
+      "invalid_mapping": "导入的雷达实体或适配器配置无效。"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "修改雷达来源",
+        "description": "修改实体映射会保留已有米家绑定。光照留空时，仅向米家报告 0 lx。",
+        "data": {
+          "name": "名称",
+          "presence_entity": "存在实体",
+          "illuminance_entity": "光照实体（可选）",
+          "adapter": "主机蓝牙适配器"
+        }
+      }
+    },
+    "error": {
+      "entity_not_found": "找不到所选实体。已登记的离线实体可以使用。",
+      "invalid_presence_entity": "存在来源必须是 binary_sensor 实体。",
+      "invalid_illuminance_entity": "光照来源必须是 sensor 实体。",
+      "entity_already_mapped": "该存在实体已经添加了米家转发。",
+      "invalid_adapter": "请输入主机适配器名称，例如 hci0。",
+      "invalid_name": "名称必须是文本。"
+    }
+  },
+  "entity": {
+    "button": {
+      "start_pairing": {"name": "开始米家配对"},
+      "stop_pairing": {"name": "结束配对"}
+    },
+    "sensor": {
+      "forwarding_status": {"name": "转发状态"}
+    }
+  }
+}

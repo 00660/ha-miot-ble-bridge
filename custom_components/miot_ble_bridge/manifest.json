@@ -1,0 +1,12 @@
+{
+  "domain": "miot_ble_bridge",
+  "name": "HA MiOT BLE Bridge",
+  "version": "0.1.0",
+  "codeowners": ["@00660"],
+  "config_flow": true,
+  "dependencies": ["bluetooth"],
+  "documentation": "https://github.com/00660/ha-miot-ble-bridge",
+  "issue_tracker": "https://github.com/00660/ha-miot-ble-bridge/issues",
+  "iot_class": "local_push",
+  "loggers": ["custom_components.miot_ble_bridge"]
+}
