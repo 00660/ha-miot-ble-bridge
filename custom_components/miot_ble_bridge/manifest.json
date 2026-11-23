@@ -1,7 +1,7 @@
 {
   "domain": "miot_ble_bridge",
   "name": "HA MiOT BLE Bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "codeowners": ["@00660"],
   "config_flow": true,
   "dependencies": ["bluetooth"],

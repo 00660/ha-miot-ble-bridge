@@ -7,6 +7,7 @@ import hmac
 from pathlib import Path
 import struct
 import unittest
+from unittest.mock import patch
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -226,21 +227,72 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(pending["bind_key"], setup[12:28].hex())
         self.assertFalse(self.device.bound)
         deliver_parcel(self.device, 7, bytes(163))
-        self.assertNotIn((0x0010, b"\x11\x00\x00\x00"), self.device.drain_notifications())
+        self.assertIn((0x0010, b"\x11\x00\x00\x00"), self.device.drain_notifications())
+        self.assertFalse(self.device.bound)
         self.device.commit_identity(pending)
         self.assertTrue(self.device.bound)
-        self.assertEqual(self.device.drain_notifications(), [(0x0010, b"\x11\x00\x00\x00")])
+        self.assertEqual(self.device.drain_notifications(), [])
         restarted = protocol.MiotProtocol(MAC, pending)
         self.assertTrue(restarted.bound)
+
+    def test_certificate_first_acknowledges_before_cloud_did_and_save(self):
+        for certificate_size in (24, 163):
+            with self.subTest(certificate_size=certificate_size):
+                self.setUp()
+                setup = self.start_registration()
+                deliver_parcel(self.device, 7, bytes(certificate_size))
+                self.assertIn((0x0010, b"\x11\x00\x00\x00"), self.device.drain_notifications())
+                self.assertFalse(self.device.bound)
+                self.assertIsNone(self.device.pending_identity)
+                self.assertEqual(self.device._state, "register_cloud")
+                self.device.write(0x0010, b"\x13\x00\x00\x00", 0.1)
+                self.assertFalse(self.device.bound)
+                self.send_cloud_identity(setup)
+                self.assertFalse(self.device.bound)
+                pending = self.device.pending_identity
+                self.assertEqual(pending["did"], IDENTITY["did"])
+                self.device.drain_notifications()
+                self.device.commit_identity(pending)
+                self.assertTrue(self.device.bound)
+                self.assertEqual(self.device._state, "idle")
+                self.assertEqual(self.device.drain_notifications(), [])
+
+    def test_saved_cloud_did_first_waits_for_certificate_receipt(self):
+        setup = self.start_registration()
+        self.send_cloud_identity(setup)
+        pending = self.device.pending_identity
+        self.device.drain_notifications()
+        self.device.commit_identity(pending)
+        self.assertTrue(self.device.bound)
+        self.assertEqual(self.device.drain_notifications(), [])
+        deliver_parcel(self.device, 7, bytes(24))
+        results = [packet for channel, packet in self.device.drain_notifications() if channel == 0x0010]
+        self.assertEqual(results, [b"\x11\x00\x00\x00"])
+        self.assertEqual(self.device._state, "idle")
+
+    def test_duplicate_certificate_does_not_duplicate_registration_receipt(self):
+        setup = self.start_registration()
+        deliver_parcel(self.device, 7, bytes(163))
+        deliver_parcel(self.device, 7, bytes(163))
+        results = [packet for channel, packet in self.device.drain_notifications() if channel == 0x0010]
+        self.assertEqual(results, [b"\x11\x00\x00\x00"])
+        self.assertFalse(self.device.bound)
+        self.send_cloud_identity(setup)
+        pending = self.device.pending_identity
+        self.device.drain_notifications()
+        self.device.commit_identity(pending)
+        deliver_parcel(self.device, 7, bytes(163))
+        results = [packet for channel, packet in self.device.drain_notifications() if channel == 0x0010]
+        self.assertEqual(results, [])
 
     def test_certificate_without_authenticated_did_cannot_bind(self):
         self.start_registration()
         deliver_parcel(self.device, 7, bytes(163))
         self.assertFalse(self.device.bound)
         self.assertIsNone(self.device.pending_identity)
-        self.assertNotIn((0x0010, b"\x11\x00\x00\x00"), self.device.drain_notifications())
+        self.assertIn((0x0010, b"\x11\x00\x00\x00"), self.device.drain_notifications())
 
-    def test_failed_save_does_not_ack_registration(self):
+    def test_failed_save_does_not_complete_cloud_binding(self):
         setup = self.start_registration()
         self.send_cloud_identity(setup)
         deliver_parcel(self.device, 7, bytes(24))
@@ -352,6 +404,14 @@ class LoginAndSpecTests(unittest.TestCase):
         self.assertFalse(self.device.logged_in)
         self.assertEqual(self.device.read(0x0010), b"")
         self.assertEqual(self.device.drain_notifications(), [])
+
+    def test_connect_reuses_startup_ec_key_without_generating_in_callback(self):
+        startup_key = self.device._private_key
+        with patch.object(protocol.ec, "generate_private_key", side_effect=AssertionError("Callback generated an EC key")):
+            self.device.connect(0.0)
+            self.device.disconnect()
+            self.device.connect(1.0)
+        self.assertIs(self.device._private_key, startup_key)
 
     def test_unbound_or_invalid_login_never_creates_spec_session(self):
         unbound = protocol.MiotProtocol(MAC)

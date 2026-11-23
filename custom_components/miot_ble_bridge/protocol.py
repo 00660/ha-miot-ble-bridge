@@ -261,7 +261,6 @@ class MiotProtocol:
 
     def connect(self, now: float | None = None) -> None:
         self.disconnect()
-        self._private_key = ec.generate_private_key(ec.SECP256R1())
         self._connected = True
         self.last_error = None
 
@@ -367,7 +366,10 @@ class MiotProtocol:
         elif self._state == "register_cloud" and len(payload) == 92:
             self._register_did(payload)
         elif self._state == "register_cloud" and len(payload) in (24, 163):
-            self._certificate_received = True
+            # The phone can wait for this receipt before sending its cloud DID.
+            if not self._certificate_received:
+                self._certificate_received = True
+                self._result(0x11)
             self._finish_registration()
         elif self._state == "login_random" and package_type == 0x0B and len(payload) == 16:
             self._login_random(payload, now)
@@ -453,7 +455,6 @@ class MiotProtocol:
             and self._identity == self._registration
             and self._pending_identity is None
         ):
-            self._result(0x11)
             self._state = "idle"
             self._certificate_received = False
 
