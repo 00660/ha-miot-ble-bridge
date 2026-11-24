@@ -80,11 +80,76 @@ class MappingTests(unittest.TestCase):
         self.assertIs(mappings.read_entity_value(prop, state("off"), mapping), True)
         self.assertEqual(mappings.property_service_call(prop, False, mapping), ("switch", "turn_on", {"entity_id": "switch.test"}))
 
+    def test_door_contact_automatically_uses_the_model_closed_boolean(self):
+        for model_id, key in (("isa.magnet.dw2hl", "2.2"), ("xiaomi.magnet.03", "2.1012")):
+            prop = models.get_model(model_id).property_by_key[key]
+            mapping = {"source": "entity", "entity_id": "binary_sensor.door"}
+            for raw, expected in (("on", False), ("off", True), ("open", False), ("closed", True), (True, False), (False, True)):
+                with self.subTest(model=model_id, raw=raw):
+                    self.assertIs(mappings.read_entity_value(prop, state(raw, device_class="door"), mapping), expected)
+            self.assertEqual(mapping, {"source": "entity", "entity_id": "binary_sensor.door"})
+
+    def test_door_contact_preserves_explicit_old_inverse_and_value_map(self):
+        prop = models.get_model("isa.magnet.dw2hl").property_by_key["2.2"]
+        mapping = {"entity_id": "binary_sensor.door"}
+        self.assertIs(mappings.read_entity_value(prop, state("on"), {**mapping, "invert": False}), True)
+        self.assertIs(mappings.read_entity_value(prop, state("on"), {**mapping, "invert": True}), False)
+        self.assertIs(mappings.read_entity_value(prop, state("on"), {**mapping, "value_map": {"on": False, "off": True}}), False)
+        self.assertIs(mappings.read_entity_value(prop, state("on"), {**mapping, "value_map": {"on": True, "off": False}}), True)
+
     def test_select_value_map_is_reversed_for_mijia_writes(self):
         prop = self.cooler.property_by_key["3.1"]
         mapping = {"source": "entity", "entity_id": "select.cooling", "value_map": {"auto": 0, "maximum": 1}}
         self.assertEqual(mappings.read_entity_value(prop, state("maximum"), mapping), 1)
         self.assertEqual(mappings.property_service_call(prop, 1, mapping), ("select", "select_option", {"entity_id": "select.cooling", "option": "maximum"}))
+
+    def test_smoke_enum_is_automatic_without_an_attribute_or_manual_map(self):
+        prop = models.get_model("xiaomi.sensor_smoke.yg2").property_by_key["2.1004"]
+        mapping = {"source": "entity", "entity_id": "binary_sensor.smoke"}
+        self.assertEqual(mappings.read_entity_value(prop, state("off", device_class="smoke"), mapping), 1)
+        self.assertEqual(mappings.read_entity_value(prop, state("on", device_class="smoke"), mapping), 2)
+        self.assertEqual(mapping, {"source": "entity", "entity_id": "binary_sensor.smoke"})
+
+    def test_known_select_labels_are_automatic_and_bidirectional(self):
+        prop = self.cooler.property_by_key["3.1"]
+        mapping = {"source": "entity", "entity_id": "select.cooling"}
+        source = state("extreme", options=["intelligent", "extreme"])
+        self.assertEqual(mappings.read_entity_value(prop, source, mapping), 1)
+        self.assertEqual(mappings.property_service_call(prop, 0, mapping, source)[2]["option"], "intelligent")
+
+    def test_saved_enum_mapping_overrides_automatic_inference(self):
+        prop = models.get_model("xiaomi.sensor_smoke.yg2").property_by_key["2.1004"]
+        mapping = {"entity_id": "binary_sensor.smoke", "value_map": {"on": 1, "off": 2}}
+        self.assertEqual(mappings.read_entity_value(prop, state("on"), mapping), 1)
+        self.assertEqual(mappings.read_entity_value(prop, state("off"), mapping), 2)
+
+    def test_numeric_sensor_uses_its_state_and_does_not_choose_an_unrelated_attribute(self):
+        prop = self.cooler.property_by_key["3.3"]
+        mapping = {"entity_id": "sensor.temperature"}
+        source = state("20", temperature=75, unit_of_measurement="°C")
+        self.assertIsNone(mappings.effective_attribute(prop, mapping["entity_id"], mapping, source))
+        self.assertEqual(mappings.read_entity_value(prop, source, mapping), 20)
+
+    def test_unique_temperature_attribute_is_automatic(self):
+        prop = self.cooler.property_by_key["3.3"]
+        mapping = {"entity_id": "sensor.device"}
+        source = state("ready", temperature=25)
+        self.assertEqual(mappings.effective_attribute(prop, mapping["entity_id"], mapping, source), "temperature")
+        self.assertEqual(mappings.read_entity_value(prop, source, mapping), 25)
+
+    def test_event_result_attribute_is_automatic_and_explicit_overrides_still_work(self):
+        prop = models.get_model("yunmai.scales.ms103").property_by_key["8.1"]
+        mapping = {"entity_id": "sensor.result"}
+        source = state("2026-11-24T00:00:00+00:00", result="645,1", alternate="0,6")
+        self.assertEqual(mappings.effective_attribute(prop, mapping["entity_id"], mapping, source), "result")
+        self.assertEqual(mappings.read_entity_value(prop, source, mapping), "645,1")
+        self.assertEqual(mappings.read_entity_value(prop, source, {**mapping, "attribute": "alternate"}), "0,6")
+
+    def test_unknown_select_option_is_not_assigned_an_index(self):
+        prop = self.cooler.property_by_key["3.1"]
+        source = state("vendor_special", options=["vendor_special", "other_special"])
+        with self.assertRaises(ValueError):
+            mappings.read_entity_value(prop, source, {"entity_id": "select.cooling"})
 
     def test_unknown_source_is_omitted_even_with_cached_attributes(self):
         prop = self.light.property_by_key["7.2"]

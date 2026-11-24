@@ -13,6 +13,35 @@ from typing import Any, Literal, Mapping
 
 DEFAULT_MODEL = "xiaomi.sensor_occupy.03"
 
+CATEGORY_OPTIONS = (
+    {"value": "binary_sensor", "label": "人体、门窗与安防传感器"},
+    {"value": "sensor", "label": "环境与测量传感器"},
+    {"value": "button", "label": "无线按键"},
+    {"value": "light", "label": "灯光"},
+    {"value": "outlet", "label": "插座"},
+    {"value": "appliance", "label": "其他家电"},
+)
+_MODEL_CATEGORIES = {
+    "esp32/occ_adv": "binary_sensor", "esp32/door_adv": "binary_sensor",
+    "esp32/door3_adv": "binary_sensor", "esp32/motion_adv": "binary_sensor",
+    "esp32/pir2s_adv": "binary_sensor", "esp32/leak_adv": "binary_sensor",
+    "esp32/gas_adv": "binary_sensor", "esp32/smoke_adv": "binary_sensor",
+    "esp32/smoke2_adv": "binary_sensor", "esp32/flood2_adv": "binary_sensor",
+    "esp32/senpres_adv": "binary_sensor", "esp32/nl1_adv": "binary_sensor",
+    "esp32/thermo_gatt": "sensor", "esp32/hcho_adv": "sensor",
+    "examples/thermo_t3m": "sensor", "esp32/t3pro_adv": "sensor",
+    "esp32/plant_adv": "sensor", "esp32/airm_adv": "sensor",
+    "esp32/scale_adv": "sensor",
+    "esp32/btn1_adv": "button", "esp32/btn2_adv": "button",
+    "esp32/v5kwm_adv": "button", "esp32/ptxsw1_adv": "button",
+    "esp32/carlight_adv": "light", "esp32/nightl2_adv": "light",
+    "esp32/bulb_gatt": "light", "esp32/outlet_adv": "outlet",
+    "esp32/cooler_adv": "appliance", "esp32/kettle_adv": "appliance",
+    "esp32/diffuser_adv": "appliance", "esp32/toothbrush_adv": "appliance",
+    "esp32/brushpro_adv": "appliance", "esp32/petwater_adv": "appliance",
+    "esp32/wx08zm_gatt": "appliance",
+}
+
 BOOL, U8, I8, U16, I16, U32, I32, U64, I64, FLOAT, STRING = range(11)
 _FORMATS = {BOOL: "B", U8: "B", I8: "b", U16: "H", I16: "h", U32: "I", I32: "i", U64: "Q", I64: "q", FLOAT: "f"}
 _BEACON_TYPES = {"bool": BOOL, "u8": U8, "i8": I8, "u16": U16, "i16": I16, "u32": U32, "i32": I32, "u64": U64, "i64": I64, "f32": FLOAT}
@@ -210,6 +239,10 @@ class ModelDefinition:
     unavailable_reason: str | None = None
     limitations: tuple[str, ...] = ()
     source_dir: str = ""
+
+    @property
+    def category(self) -> str:
+        return _MODEL_CATEGORIES.get(self.source_dir, "sensor")
 
     @property
     def property_by_key(self) -> dict[str, PropertyDefinition]:

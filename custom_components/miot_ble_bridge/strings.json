@@ -2,22 +2,22 @@
   "config": {
     "step": {
       "user": {
-        "title": "选择要桥接的 HA 设备",
-        "description": "先选 HA 设备，再选米家型号，逐项配置属性来源。每个设备与型号单独添加。",
+        "title": "选择设备类型",
+        "description": "先选设备类型，再选米家型号和兼容的 HA 设备。",
         "data": {
-          "source_device_id": "HA 设备"
+          "device_type": "设备类型"
         }
       },
       "model": {
         "title": "选择米家型号",
-        "description": "选择当前已适配的米家蓝牙型号。同一个 HA 设备可以添加不同型号。",
+        "description": "只显示所选设备类型对应的可用米家型号。",
         "data": {
           "model": "米家型号"
         }
       },
       "settings": {
-        "title": "设置设备名称与蓝牙适配器",
-        "description": "设置这台米家设备的名称，以及 HA 主机实际使用的蓝牙适配器。",
+        "title": "高级：设备名称与蓝牙适配器",
+        "description": "名称和 hci0 已自动填写，仅在需要修改时调整。",
         "data": {
           "name": "米家设备名称",
           "adapter": "主机蓝牙适配器"
@@ -29,9 +29,17 @@
       },
       "property_source": {
         "title": "{property}（{index}/{total}）",
-        "description": "选择 {property} 的来源。每个米家设备独立保存自己的映射。",
+        "description": "{source_hint} 选好实体即可继续，实体属性会自动识别。",
         "data": {
-          "source": "属性来源"
+          "entity_id": "HA 实体",
+          "use_virtual": "使用虚拟固定值",
+          "advanced": "高级设置",
+          "use_derived": "自动计算"
+        },
+        "data_description": {
+          "use_virtual": "仅在需要固定值时勾选，不会创建 HA 实体。",
+          "advanced": "需要其它设备、模板来源或自定义实体属性时勾选。",
+          "use_derived": "按现有来源自动计算持续时间或设备时间。"
         }
       },
       "property_virtual": {
@@ -42,23 +50,24 @@
         }
       },
       "property_entity": {
-        "title": "选择 {property} 的 HA 实体",
-        "description": "优先选择原设备的实体。已登记的离线实体可以配置；也可以在上一步选择其他 HA 实体。",
+        "title": "高级来源：{property}",
+        "description": "勾选“使用其它 HA 设备的实体”后，可选兼容的其它设备或模板来源。",
         "data": {
-          "entity_id": "HA 实体"
+          "entity_id": "HA 实体",
+          "use_other_entities": "使用其它 HA 设备的实体"
         }
       },
       "property_details": {
-        "title": "检查 {property} 的来源",
-        "description": "读取实体状态或指定属性。数值单位会按支持的转换处理；米家可写属性必须映射到兼容的可控制实体。",
+        "title": "高级设置：{property}",
+        "description": "普通配置会自动识别来源，仅在需要自定义时修改这些选项。",
         "data": {
-          "attribute": "实体属性（留空使用默认来源）",
-          "invert": "反转开关或存在状态",
-          "configure_value_map": "配置 HA 状态与米家枚举的对应关系"
+          "attribute": "读取实体属性（通常留空）",
+          "invert": "反转开关、门磁或存在状态",
+          "configure_value_map": "自定义状态对应关系"
         },
         "data_description": {
-          "attribute": "例如风扇 percentage、灯光 brightness、空调 temperature；可用属性由所选实体提供。",
-          "configure_value_map": "HA select 选项或 binary_sensor 的 off/on 与米家枚举不同编号时，逐项明确选择对应值。"
+          "attribute": "例如自定义传感器的 result 属性；留空时自动识别。",
+          "configure_value_map": "只在自动状态识别不适用时，逐项指定 HA 状态对应的米家值。"
         }
       },
       "property_value_map": {
@@ -72,28 +81,57 @@
       },
       "features": {
         "title": "检查 {model} 的配置",
-        "description": "属性已配置。可继续配置动作与事件，或完成当前设备。",
+        "description": "实体来源已配置。电量和持续时间默认自动处理，可通过高级入口修改。",
         "menu_options": {
-          "properties": "逐项检查属性来源",
-          "actions": "配置米家动作",
-          "events": "配置 HA 事件转发",
-          "finish": "完成配置"
+          "properties": "修改设备内实体",
+          "actions": "米家动作",
+          "events": "HA 事件转发",
+          "finish": "完成配置",
+          "default_properties": "高级：电量与自动计算属性",
+          "settings": "高级：名称与蓝牙适配器"
         }
       },
       "action": {
         "title": "配置动作：{action}",
-        "description": "选择当前设备的虚拟动作，或让米家动作执行一个 HA 按钮、脚本或自动化。",
+        "description": "选择这台 HA 设备的按钮，选好即可继续。",
         "data": {
-          "source": "动作来源",
-          "entity_id": "HA 按钮、脚本或自动化"
+          "entity_id": "HA 按钮",
+          "use_virtual": "使用虚拟动作",
+          "advanced": "高级设置"
+        },
+        "data_description": {
+          "use_virtual": "按该型号的虚拟逻辑执行。",
+          "advanced": "需要其它设备、脚本或自动化时勾选。"
+        }
+      },
+      "action_advanced": {
+        "title": "高级动作：{action}",
+        "description": "勾选“使用其它 HA 设备的实体”后，可选择兼容的其它设备、脚本或自动化。",
+        "data": {
+          "entity_id": "HA 按钮、脚本或自动化",
+          "use_virtual": "使用虚拟动作",
+          "use_other_entities": "使用其它 HA 设备的实体"
         }
       },
       "event": {
         "title": "配置事件：{event}",
-        "description": "HA 实体发生符合条件的状态变化时，向米家发送此事件。按钮与时间戳来源通常留空目标状态，以转发每次有效变化。",
+        "description": "选择这台 HA 设备的按钮或按压事件。选好来源即可继续，目标状态和参数在高级设置中修改。",
         "data": {
-          "source": "事件来源",
           "entity_id": "触发事件的 HA 实体",
+          "enabled": "转发此事件",
+          "advanced": "高级设置"
+        },
+        "data_description": {
+          "advanced": "需要其它设备、额外事件来源或自定义参数时勾选。"
+        }
+      },
+      "event_advanced": {
+        "title": "高级事件：{event}",
+        "description": "勾选“使用其它 HA 设备的实体”后扩大来源范围，再按需要设置目标状态和事件参数。",
+        "data": {
+          "entity_id": "触发事件的 HA 实体",
+          "enabled": "转发此事件",
+          "use_other_entities": "使用其它 HA 设备的实体",
           "trigger_value": "目标状态（留空监听每次有效变化）",
           "custom_arguments": "自定义事件参数"
         },
@@ -113,6 +151,13 @@
       "finish": {
         "title": "完成 {name} 的配置",
         "description": "HA 设备：{device}\n米家型号：{model}\n完成后使用本设备的“开始米家配对”按钮进行添加。修改已有配置会保留原米家身份。"
+      },
+      "device": {
+        "title": "选择兼容的 HA 设备",
+        "description": "仅列出有兼容实体的 HA 设备，当前米家型号：{model}。",
+        "data": {
+          "source_device_id": "HA 设备"
+        }
       }
     },
     "error": {
@@ -134,7 +179,13 @@
       "invalid_state_value": "请输入有效的 HA 状态；unknown 和 unavailable 不能作为事件或枚举值。",
       "invalid_value_map": "请选择合法的米家枚举，可写值必须对应唯一的 HA 状态。",
       "model_unavailable": "此型号的蓝牙协议暂不可用，请选择列表中的可用型号。",
-      "model_locked": "已有配置的米家型号固定。更换型号需要新建配置并重新配对。"
+      "model_locked": "已有配置的米家型号固定。更换型号需要新建配置并重新配对。",
+      "invalid_device_type": "请选择有效的设备类型。",
+      "incompatible_device": "该设备没有此米家型号可用的兼容来源。",
+      "no_compatible_device": "没有兼容的 HA 设备，请选择其它型号。",
+      "select_entity": "请选择 HA 实体，或明确勾选虚拟值。",
+      "no_compatible_entity": "该设备没有兼容实体。可勾选高级设置选择其它来源，或明确使用虚拟值。",
+      "incompatible_entity": "该实体不适合此属性，请选择兼容实体、虚拟值，或使用高级设置。"
     },
     "abort": {
       "already_configured": "该 HA 设备已经配置了此米家型号。",
@@ -147,18 +198,37 @@
     "step": {
       "init": {
         "title": "修改 {model} 的来源",
-        "description": "型号保持固定，修改来源会保留已有米家绑定。更换型号需新建配置。",
+        "description": "米家型号和已有身份保持不变，修改所选设备中的实体来源。",
         "data": {
-          "source_device_id": "HA 设备",
           "name": "米家设备名称",
           "adapter": "主机蓝牙适配器"
         }
       },
+      "settings": {
+        "title": "高级：设备名称与蓝牙适配器",
+        "description": "修改当前配置的名称和蓝牙适配器。",
+        "data": {
+          "name": "米家设备名称",
+          "adapter": "主机蓝牙适配器"
+        },
+        "data_description": {
+          "name": "留空时使用 HA 设备名称。",
+          "adapter": "例如 hci0；每个配置独立保存。"
+        }
+      },
       "property_source": {
         "title": "{property}（{index}/{total}）",
-        "description": "选择 {property} 的来源。每个米家设备独立保存自己的映射。",
+        "description": "{source_hint} 选好实体即可继续，实体属性会自动识别。",
         "data": {
-          "source": "属性来源"
+          "entity_id": "HA 实体",
+          "use_virtual": "使用虚拟固定值",
+          "advanced": "高级设置",
+          "use_derived": "自动计算"
+        },
+        "data_description": {
+          "use_virtual": "仅在需要固定值时勾选，不会创建 HA 实体。",
+          "advanced": "需要其它设备、模板来源或自定义实体属性时勾选。",
+          "use_derived": "按现有来源自动计算持续时间或设备时间。"
         }
       },
       "property_virtual": {
@@ -169,23 +239,24 @@
         }
       },
       "property_entity": {
-        "title": "选择 {property} 的 HA 实体",
-        "description": "优先选择原设备的实体。已登记的离线实体可以配置；也可以在上一步选择其他 HA 实体。",
+        "title": "高级来源：{property}",
+        "description": "勾选“使用其它 HA 设备的实体”后，可选兼容的其它设备或模板来源。",
         "data": {
-          "entity_id": "HA 实体"
+          "entity_id": "HA 实体",
+          "use_other_entities": "使用其它 HA 设备的实体"
         }
       },
       "property_details": {
-        "title": "检查 {property} 的来源",
-        "description": "读取实体状态或指定属性。数值单位会按支持的转换处理；米家可写属性必须映射到兼容的可控制实体。",
+        "title": "高级设置：{property}",
+        "description": "普通配置会自动识别来源，仅在需要自定义时修改这些选项。",
         "data": {
-          "attribute": "实体属性（留空使用默认来源）",
-          "invert": "反转开关或存在状态",
-          "configure_value_map": "配置 HA 状态与米家枚举的对应关系"
+          "attribute": "读取实体属性（通常留空）",
+          "invert": "反转开关、门磁或存在状态",
+          "configure_value_map": "自定义状态对应关系"
         },
         "data_description": {
-          "attribute": "例如风扇 percentage、灯光 brightness、空调 temperature；可用属性由所选实体提供。",
-          "configure_value_map": "HA select 选项或 binary_sensor 的 off/on 与米家枚举不同编号时，逐项明确选择对应值。"
+          "attribute": "例如自定义传感器的 result 属性；留空时自动识别。",
+          "configure_value_map": "只在自动状态识别不适用时，逐项指定 HA 状态对应的米家值。"
         }
       },
       "property_value_map": {
@@ -199,28 +270,57 @@
       },
       "features": {
         "title": "检查 {model} 的配置",
-        "description": "属性已配置。可继续配置动作与事件，或完成当前设备。",
+        "description": "实体来源已配置。电量和持续时间默认自动处理，可通过高级入口修改。",
         "menu_options": {
-          "properties": "逐项检查属性来源",
-          "actions": "配置米家动作",
-          "events": "配置 HA 事件转发",
-          "finish": "完成配置"
+          "properties": "修改设备内实体",
+          "actions": "米家动作",
+          "events": "HA 事件转发",
+          "finish": "完成配置",
+          "default_properties": "高级：电量与自动计算属性",
+          "settings": "高级：名称与蓝牙适配器"
         }
       },
       "action": {
         "title": "配置动作：{action}",
-        "description": "选择当前设备的虚拟动作，或让米家动作执行一个 HA 按钮、脚本或自动化。",
+        "description": "选择这台 HA 设备的按钮，选好即可继续。",
         "data": {
-          "source": "动作来源",
-          "entity_id": "HA 按钮、脚本或自动化"
+          "entity_id": "HA 按钮",
+          "use_virtual": "使用虚拟动作",
+          "advanced": "高级设置"
+        },
+        "data_description": {
+          "use_virtual": "按该型号的虚拟逻辑执行。",
+          "advanced": "需要其它设备、脚本或自动化时勾选。"
+        }
+      },
+      "action_advanced": {
+        "title": "高级动作：{action}",
+        "description": "勾选“使用其它 HA 设备的实体”后，可选择兼容的其它设备、脚本或自动化。",
+        "data": {
+          "entity_id": "HA 按钮、脚本或自动化",
+          "use_virtual": "使用虚拟动作",
+          "use_other_entities": "使用其它 HA 设备的实体"
         }
       },
       "event": {
         "title": "配置事件：{event}",
-        "description": "HA 实体发生符合条件的状态变化时，向米家发送此事件。按钮与时间戳来源通常留空目标状态，以转发每次有效变化。",
+        "description": "选择这台 HA 设备的按钮或按压事件。选好来源即可继续，目标状态和参数在高级设置中修改。",
         "data": {
-          "source": "事件来源",
           "entity_id": "触发事件的 HA 实体",
+          "enabled": "转发此事件",
+          "advanced": "高级设置"
+        },
+        "data_description": {
+          "advanced": "需要其它设备、额外事件来源或自定义参数时勾选。"
+        }
+      },
+      "event_advanced": {
+        "title": "高级事件：{event}",
+        "description": "勾选“使用其它 HA 设备的实体”后扩大来源范围，再按需要设置目标状态和事件参数。",
+        "data": {
+          "entity_id": "触发事件的 HA 实体",
+          "enabled": "转发此事件",
+          "use_other_entities": "使用其它 HA 设备的实体",
           "trigger_value": "目标状态（留空监听每次有效变化）",
           "custom_arguments": "自定义事件参数"
         },
@@ -261,7 +361,13 @@
       "invalid_state_value": "请输入有效的 HA 状态；unknown 和 unavailable 不能作为事件或枚举值。",
       "invalid_value_map": "请选择合法的米家枚举，可写值必须对应唯一的 HA 状态。",
       "model_unavailable": "此型号的蓝牙协议暂不可用，请选择列表中的可用型号。",
-      "model_locked": "已有配置的米家型号固定。更换型号需要新建配置并重新配对。"
+      "model_locked": "已有配置的米家型号固定。更换型号需要新建配置并重新配对。",
+      "invalid_device_type": "请选择有效的设备类型。",
+      "incompatible_device": "该设备没有此米家型号可用的兼容来源。",
+      "no_compatible_device": "没有兼容的 HA 设备，请选择其它型号。",
+      "select_entity": "请选择 HA 实体，或明确勾选虚拟值。",
+      "no_compatible_entity": "该设备没有兼容实体。可勾选高级设置选择其它来源，或明确使用虚拟值。",
+      "incompatible_entity": "该实体不适合此属性，请选择兼容实体、虚拟值，或使用高级设置。"
     },
     "abort": {
       "already_configured": "目标 HA 设备已经配置了此米家型号。",

@@ -9,6 +9,20 @@ from typing import Any
 _MISSING = {"unknown", "unavailable", "none", "null", ""}
 _TRUE = {"on", "true", "yes", "open", "wet", "detected", "1"}
 _FALSE = {"off", "false", "no", "closed", "dry", "clear", "0"}
+_CHOICE_NAMES = (
+    {"auto", "automatic", "自动"}, {"smart", "intelligent", "智能"},
+    {"manual", "手动"}, {"custom", "自定义"},
+    {"on", "enabled", "开启", "打开", "开机"},
+    {"off", "disabled", "关闭", "关机"},
+    {"open", "opened", "门开"}, {"closed", "门关"},
+    {"normal", "正常"}, {"alarm", "alert", "告警", "烟雾告警"},
+    {"charging", "充电", "充电中", "正在充电"},
+    {"notcharging", "discharging", "未充电", "不充电"},
+    {"full", "charged", "充满", "已充满", "满电", "充足"},
+    {"low", "lowbattery", "不足", "低电量", "电量不足"},
+    {"bright", "明亮", "亮"}, {"dark", "暗"},
+    {"extreme", "maximum", "极寒"},
+)
 
 
 def default_mappings(model, config: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -37,7 +51,7 @@ def default_mappings(model, config: dict[str, Any]) -> dict[str, dict[str, Any]]
     return result
 
 
-def effective_attribute(prop, entity_id: str, mapping: dict[str, Any]) -> str | None:
+def effective_attribute(prop, entity_id: str, mapping: dict[str, Any], state=None) -> str | None:
     if mapping.get("attribute"):
         return mapping["attribute"]
     domain = entity_id.partition(".")[0]
@@ -51,7 +65,63 @@ def effective_attribute(prop, entity_id: str, mapping: dict[str, Any]) -> str | 
         return "percentage"
     if domain == "climate" and semantic in {"temperature", "target_temperature"}:
         return "temperature" if prop.writable else "current_temperature"
+    if state is not None and domain in {"sensor", "event"}:
+        candidates = {
+            "weight_data": ("result", "result_csv", "measurement_result"),
+            "temperature": ("temperature", "current_temperature"),
+            "humidity": ("humidity", "relative_humidity"),
+            "illuminance": ("illuminance", "lux"),
+            "battery": ("battery_level", "battery"),
+            "measurement_time": ("measurement_time", "timestamp"),
+        }.get(semantic, ())
+        if semantic != "weight_data":
+            try:
+                float(state.state)
+                return None
+            except (ValueError, TypeError):
+                pass
+        present = [key for key in candidates if state.attributes.get(key) is not None]
+        if len(present) == 1:
+            return present[0]
     return None
+
+
+def _choice_name(value: Any) -> str:
+    return str(value).strip().lower().replace("_", "").replace("-", "").replace(" ", "")
+
+
+def _matching_choice(prop, names: set[str]) -> Any | None:
+    candidates = [value for value, label in prop.choices if _choice_name(label) in names]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def automatic_value_map(prop, state, mapping: dict[str, Any]) -> dict[str, Any]:
+    """Match explicit enum labels; never infer numeric values from option order."""
+    result: dict[str, Any] = {}
+    if prop.choices:
+        domain = mapping["entity_id"].partition(".")[0]
+        if domain in {"binary_sensor", "switch", "input_boolean"}:
+            pairs = {
+                "smoke_status": ({"正常"}, {"烟雾告警", "告警"}),
+                "light_degree": ({"暗"}, {"亮", "明亮"}),
+                "charging": ({"未充电", "不充电"}, {"充电中", "正在充电", "充电"}),
+                "battery_status": ({"充足", "正常", "满电"}, {"不足", "低电量", "电量不足"}),
+            }.get(prop.semantic)
+            if pairs:
+                off, on = (_matching_choice(prop, names) for names in pairs)
+                if off is not None and on is not None:
+                    result.update(off=off, on=on)
+        raw_values = list(state.attributes.get("options", ())) if state is not None else []
+        if state is not None:
+            raw_values.append(state.state)
+        for raw in raw_values:
+            name = _choice_name(raw)
+            group = next((names for names in _CHOICE_NAMES if name in names), {name})
+            value = _matching_choice(prop, group)
+            if value is not None:
+                result[str(raw)] = value
+    result.update(mapping.get("value_map", {}))
+    return result
 
 
 def _convert_unit(value: float, source: str | None, target: str | None) -> float:
@@ -93,11 +163,11 @@ def read_entity_value(prop, state, mapping: dict[str, Any]) -> Any | None:
     if state is None or str(state.state).lower() in _MISSING:
         return None
     entity_id = mapping["entity_id"]
-    attribute = effective_attribute(prop, entity_id, mapping)
+    attribute = effective_attribute(prop, entity_id, mapping, state)
     value = state.attributes.get(attribute) if attribute else state.state
     if value is None or (isinstance(value, str) and value.lower() in _MISSING):
         return None
-    value_map = mapping.get("value_map", {})
+    value_map = automatic_value_map(prop, state, mapping)
     if str(value) in value_map:
         value = value_map[str(value)]
     elif prop.choices:
@@ -119,7 +189,7 @@ def read_entity_value(prop, state, mapping: dict[str, Any]) -> Any | None:
             value = False
         elif not isinstance(value, bool):
             raise ValueError("HA state cannot be converted to a boolean")
-        if mapping.get("invert"):
+        if mapping.get("invert", prop.semantic == "contact" and not mapping.get("value_map")):
             value = not value
     elif attribute == "rgb_color":
         if not isinstance(value, (list, tuple)) or len(value) != 3:
@@ -170,7 +240,7 @@ def property_service_call(prop, value: Any, mapping: dict[str, Any], state=None)
             value = 1 - value
     entity_id = mapping["entity_id"]
     domain = entity_id.partition(".")[0]
-    attribute = effective_attribute(prop, entity_id, mapping)
+    attribute = effective_attribute(prop, entity_id, mapping, state)
     data: dict[str, Any] = {"entity_id": entity_id}
     if domain in {"switch", "input_boolean"}:
         if prop.type_code != 0 and value not in (0, 1):
@@ -181,7 +251,7 @@ def property_service_call(prop, value: Any, mapping: dict[str, Any], state=None)
         data["value"] = _convert_unit(value, prop.unit, unit) if isinstance(value, (int, float)) else value
         return domain, "set_value", data
     if domain in {"select", "input_select"}:
-        reverse = [key for key, item in mapping.get("value_map", {}).items() if item == value]
+        reverse = [key for key, item in automatic_value_map(prop, state, mapping).items() if item == value]
         if reverse:
             data["option"] = reverse[0]
         else:

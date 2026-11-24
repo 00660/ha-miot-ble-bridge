@@ -26,6 +26,12 @@ from .const import (
     CONF_ENTITY_ID,
     CONF_ENTITY_REGISTRY_ID,
     CONF_EVENT_MAPPINGS,
+    CONF_DEVICE_TYPE,
+    CONF_USE_VIRTUAL,
+    CONF_ADVANCED,
+    CONF_USE_OTHER_ENTITIES,
+    CONF_USE_DERIVED,
+    CONF_ENABLED,
     CONF_ILLUMINANCE_ENTITY,
     CONF_ILLUMINANCE_ENTITY_REGISTRY_ID,
     CONF_NAME,
@@ -45,10 +51,8 @@ from .const import (
     DEFAULT_ADAPTER,
     DOMAIN,
     SOURCE_DERIVED,
-    SOURCE_DISABLED,
     SOURCE_ENTITY,
     SOURCE_MAPPED,
-    SOURCE_OTHER_ENTITY,
     SOURCE_VIRTUAL,
 )
 from .models import AVAILABLE_MODELS, DEFAULT_MODEL, get_model
@@ -57,6 +61,14 @@ from .mappings import (
     effective_attribute,
     property_service_call,
     read_entity_value,
+)
+from .selection import (
+    category_options,
+    eligible_devices,
+    eligible_entities,
+    eligible_event_entities,
+    eligible_action_entities,
+    recommended_entity,
 )
 
 
@@ -341,15 +353,15 @@ def _validate_property_entity(hass: HomeAssistant, prop: Any, mapping: dict[str,
     if CONF_INVERT in mapping and not isinstance(mapping[CONF_INVERT], bool):
         raise ValueError("Invalid inversion flag")
     state = hass.states.get(mapping[CONF_ENTITY_ID])
-    attribute = effective_attribute(prop, mapping[CONF_ENTITY_ID], mapping)
-    if state is not None and state.state not in {"unknown", "unavailable"} and attribute and attribute not in state.attributes:
+    attribute = effective_attribute(prop, mapping[CONF_ENTITY_ID], mapping, state)
+    if mapping.get(CONF_ATTRIBUTE) and state is not None and state.state not in {"unknown", "unavailable"} and attribute not in state.attributes:
         raise ValueError("The selected HA attribute does not exist")
     read_entity_value(prop, state, mapping)
     if control and prop.writable:
         probes = [_default_value(prop), *(value for value, _ in prop.choices)]
         probes.extend(value for value in (prop.minimum, prop.maximum) if value is not None)
         for value in probes:
-            property_service_call(prop, prop.validate(value), mapping)
+            property_service_call(prop, prop.validate(value), mapping, state)
 
 
 class _ModelMappingFlow:
@@ -363,6 +375,7 @@ class _ModelMappingFlow:
                                  if (prop.spec_visible or prop.semantic == "presence")
                                  and prop.semantic != "internal_placeholder" and not prop.alias_of)
         self._property_index = 0
+        self._editing_defaults = False
         self._property_draft: dict[str, Any] = {}
         self._all_entities = False
         self._map_states: list[str] = []
@@ -372,6 +385,8 @@ class _ModelMappingFlow:
         self._event_draft: dict[str, Any] = {}
         self._argument_index = 0
         self._argument_property: Any | None = None
+        self._action_draft: dict[str, Any] = {}
+        self._event_source_draft: dict[str, Any] = {}
 
     def _current_property(self) -> Any:
         return self._argument_property or self._properties[self._property_index]
@@ -394,41 +409,56 @@ class _ModelMappingFlow:
                 mappings[prop.key] = ({CONF_SOURCE: SOURCE_DERIVED} if prop.derived else {
                     CONF_SOURCE: SOURCE_VIRTUAL, CONF_VALUE: _default_value(prop),
                 })
-            if prefer_entities and prop in self._properties and not prop.derived and prop.semantic != "battery":
-                if entity_id := self._recommended_entity(prop):
-                    mappings[prop.key] = _entity_mapping(self.hass, entity_id, _property_domains(prop))[0]
+            if prefer_entities and prop in self._properties and not self._auto_managed(prop):
+                entity_id = self._recommended_entity(prop)
+                mappings[prop.key] = _entity_mapping(self.hass, entity_id, _property_domains(prop))[0] if entity_id else {CONF_SOURCE: SOURCE_ENTITY}
         self._data[CONF_PROPERTY_MAPPINGS] = mappings
         self._data.setdefault(CONF_ACTION_MAPPINGS, {})
         self._data.setdefault(CONF_EVENT_MAPPINGS, {})
+        self._properties = self._ordinary_properties()
 
-    def _eligible_entities(self, domains: set[str]) -> list[str]:
-        device_id = self._data.get(CONF_SOURCE_DEVICE)
-        if not device_id:
-            return []
-        return [
-            entry.entity_id
-            for entry in er.async_entries_for_device(er.async_get(self.hass), device_id)
-            if split_entity_id(entry.entity_id)[0] in domains
-        ]
+    @staticmethod
+    def _auto_managed(prop: Any) -> bool:
+        return bool(prop.derived) or prop.semantic in {"battery", "battery_status"}
+
+    def _public_properties(self) -> tuple[Any, ...]:
+        return tuple(prop for prop in self._model.properties
+                     if (prop.spec_visible or prop.semantic == "presence")
+                     and prop.semantic != "internal_placeholder" and not prop.alias_of)
+
+    def _ordinary_properties(self) -> tuple[Any, ...]:
+        mappings = self._data.get(CONF_PROPERTY_MAPPINGS, {})
+        result = []
+        for prop in self._public_properties():
+            mapping = mappings.get(prop.key, {})
+            custom = mapping.get(CONF_SOURCE) == SOURCE_ENTITY or (
+                mapping.get(CONF_SOURCE) == SOURCE_VIRTUAL and (
+                    prop.derived or mapping.get(CONF_VALUE) != prop.default
+                )
+            )
+            if not self._auto_managed(prop) or custom:
+                result.append(prop)
+        return tuple(result)
+
+    def _eligible_entities(self, prop: Any, *, allow_other: bool = False,
+                           current: Mapping[str, Any] | None = None) -> list[str]:
+        ids = eligible_entities(self.hass, self._model, prop, self._data.get(CONF_SOURCE_DEVICE), allow_other=allow_other)
+        if current and current.get(CONF_SOURCE) == SOURCE_ENTITY:
+            mapping, error = _entity_mapping(self.hass, current.get(CONF_ENTITY_ID), self._source_domains(prop))
+            if not error and mapping[CONF_ENTITY_ID] not in ids:
+                try:
+                    _validate_property_entity(self.hass, prop, {**current, **mapping}, control=self._argument_property is None)
+                except _VALUE_ERRORS:
+                    pass
+                else:
+                    ids = [*ids, mapping[CONF_ENTITY_ID]]
+        return ids
 
     def _recommended_entity(self, prop: Any) -> str | None:
-        candidates = self._eligible_entities(_property_domains(prop))
-        if prop.semantic == "presence":
-            _, _, presence = _device_entities(self.hass, self._data[CONF_SOURCE_DEVICE])
-            return presence if presence in candidates else None
-        registry = er.async_get(self.hass)
-        matching = [
-            entity_id for entity_id in candidates
-            if (entry := registry.async_get(entity_id)) is not None
-            and prop.semantic and (entry.device_class or entry.original_device_class) == prop.semantic
-        ]
-        return matching[0] if len(matching) == 1 else (candidates[0] if len(candidates) == 1 else None)
+        return recommended_entity(self.hass, self._model, prop, self._data.get(CONF_SOURCE_DEVICE))
 
-    def _entity_selector(self, domains: set[str], *, device_only: bool = False) -> Any:
-        config: dict[str, Any] = {"filter": {"domain": sorted(domains)}}
-        if device_only:
-            config["include_entities"] = self._eligible_entities(domains)
-        return selector.EntitySelector(config)
+    def _property_entity_selector(self, prop: Any, ids: list[str]) -> Any:
+        return selector.EntitySelector({"filter": {"domain": sorted(self._source_domains(prop))}, "include_entities": ids})
 
     def _resolved(self, mapping: Mapping[str, Any]) -> dict[str, Any]:
         result = deepcopy(dict(mapping))
@@ -457,6 +487,16 @@ class _ModelMappingFlow:
         }
 
     async def async_step_properties(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        self._editing_defaults = False
+        self._properties = self._ordinary_properties()
+        self._property_index = 0
+        if not self._properties and self._model.category == "button" and self._model.events:
+            return await self.async_step_events()
+        return await self.async_step_property_source()
+
+    async def async_step_default_properties(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        self._editing_defaults = True
+        self._properties = tuple(prop for prop in self._public_properties() if self._auto_managed(prop))
         self._property_index = 0
         return await self.async_step_property_source()
 
@@ -465,35 +505,67 @@ class _ModelMappingFlow:
             return await self.async_step_features()
         prop = self._properties[self._property_index]
         current = self._resolved(self._data[CONF_PROPERTY_MAPPINGS].get(prop.key, {}))
-        options = [{"value": SOURCE_VIRTUAL, "label": "虚拟值（仅当前米家设备）"}]
-        domains = _property_domains(prop)
-        if domains:
-            if self._eligible_entities(domains):
-                options.insert(0, {"value": SOURCE_ENTITY, "label": "所选 HA 设备的实体"})
-            options.insert(1, {"value": SOURCE_OTHER_ENTITY, "label": "其他 HA 实体（含模板实体）"})
-        if prop.derived:
-            options.insert(0, {"value": SOURCE_DERIVED, "label": "由 HA 来源自动计算"})
-        source = current.get(CONF_SOURCE, SOURCE_DERIVED if prop.derived else SOURCE_VIRTUAL)
-        if source == SOURCE_ENTITY and current.get(CONF_ENTITY_ID) not in self._eligible_entities(domains):
-            source = SOURCE_OTHER_ENTITY
+        ids = self._eligible_entities(prop)
+        current_id = current.get(CONF_ENTITY_ID)
+        existing_other = bool(current_id) and current.get(CONF_SOURCE) == SOURCE_ENTITY and current_id not in ids
+        if existing_other and current_id in self._eligible_entities(prop, allow_other=True, current=current):
+            ids = [*ids, current_id]
+        defaults = {
+            CONF_ENTITY_ID: current_id or self._recommended_entity(prop),
+            CONF_USE_VIRTUAL: current.get(CONF_SOURCE) == SOURCE_VIRTUAL,
+            CONF_ADVANCED: existing_other,
+        }
+        if self._editing_defaults and prop.derived:
+            defaults[CONF_USE_DERIVED] = current.get(CONF_SOURCE) == SOURCE_DERIVED
         errors: dict[str, str] = {}
         if user_input is not None:
-            source = user_input.get(CONF_SOURCE)
-            if source not in {item["value"] for item in options}:
-                errors[CONF_SOURCE] = "invalid_source"
-            elif source == SOURCE_DERIVED:
-                self._data[CONF_PROPERTY_MAPPINGS][prop.key] = {CONF_SOURCE: SOURCE_DERIVED}
-                return await self._next_property()
-            elif source == SOURCE_VIRTUAL:
+            use_virtual = user_input.get(CONF_USE_VIRTUAL, defaults[CONF_USE_VIRTUAL])
+            advanced = user_input.get(CONF_ADVANCED, defaults[CONF_ADVANCED])
+            use_derived = user_input.get(CONF_USE_DERIVED, defaults.get(CONF_USE_DERIVED, False))
+            if any(not isinstance(value, bool) for value in (use_virtual, advanced, use_derived)):
+                errors["base"] = "invalid_source"
+            elif use_virtual:
                 self._property_draft = {CONF_SOURCE: SOURCE_VIRTUAL}
                 return await self.async_step_property_virtual()
+            elif use_derived and self._editing_defaults and prop.derived:
+                self._data[CONF_PROPERTY_MAPPINGS][prop.key] = {CONF_SOURCE: SOURCE_DERIVED}
+                return await self._next_property()
             else:
-                self._all_entities = source == SOURCE_OTHER_ENTITY
                 self._property_draft = current if current.get(CONF_SOURCE) == SOURCE_ENTITY else {CONF_SOURCE: SOURCE_ENTITY}
-                return await self.async_step_property_entity()
-        return self._question("property_source", {
-            vol.Required(CONF_SOURCE): selector.SelectSelector({"options": options}),
-        }, {CONF_SOURCE: source}, self._property_placeholders(), errors)
+                self._all_entities = existing_other
+                reference = user_input.get(CONF_ENTITY_ID)
+                if advanced and not reference:
+                    return await self.async_step_property_entity()
+                mapping, error = _entity_mapping(self.hass, reference, _property_domains(prop))
+                if not error and mapping[CONF_ENTITY_ID] not in ids:
+                    error = "incompatible_entity"
+                if error:
+                    errors[CONF_ENTITY_ID if ids else "base"] = error if reference else "select_entity" if ids else "no_compatible_entity"
+                else:
+                    if mapping[CONF_ENTITY_ID] == current_id:
+                        mapping = {**current, **mapping}
+                    self._property_draft = mapping
+                    if advanced:
+                        return await self.async_step_property_entity()
+                    try:
+                        _validate_property_entity(self.hass, prop, mapping)
+                    except _VALUE_ERRORS:
+                        errors[CONF_ENTITY_ID] = "incompatible_entity"
+                    else:
+                        self._data[CONF_PROPERTY_MAPPINGS][prop.key] = mapping
+                        return await self._next_property()
+            defaults = {**defaults, **user_input}
+        schema = {}
+        if ids:
+            schema[vol.Optional(CONF_ENTITY_ID)] = self._property_entity_selector(prop, ids)
+        schema[vol.Optional(CONF_USE_VIRTUAL, default=defaults[CONF_USE_VIRTUAL])] = selector.BooleanSelector()
+        schema[vol.Optional(CONF_ADVANCED, default=defaults[CONF_ADVANCED])] = selector.BooleanSelector()
+        if self._editing_defaults and prop.derived:
+            schema[vol.Optional(CONF_USE_DERIVED, default=defaults[CONF_USE_DERIVED])] = selector.BooleanSelector()
+        return self._question("property_source", schema, defaults, {
+            **self._property_placeholders(),
+            "source_hint": "请选择这台 HA 设备的实体。" if ids else "该设备没有适合此属性的实体，可勾选虚拟值或高级设置。",
+        }, errors)
 
     async def async_step_property_virtual(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         prop = self._properties[self._property_index]
@@ -516,22 +588,40 @@ class _ModelMappingFlow:
     async def async_step_property_entity(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         prop = self._current_property()
         defaults = self._resolved(self._property_draft)
+        allow_other = self._all_entities or self._argument_property is not None
         errors: dict[str, str] = {}
         if user_input is not None:
-            mapping, error = _entity_mapping(self.hass, user_input.get(CONF_ENTITY_ID), self._source_domains(prop))
-            if not error and not self._all_entities and mapping[CONF_ENTITY_ID] not in self._eligible_entities(self._source_domains(prop)):
-                error = "wrong_device"
-            if error:
-                errors[CONF_ENTITY_ID] = error
+            previous_allow_other = allow_other
+            allow_other = user_input.get(CONF_USE_OTHER_ENTITIES, allow_other)
+            self._all_entities = allow_other
+            if allow_other != previous_allow_other:
+                defaults = {**defaults, **user_input}
             else:
-                if mapping[CONF_ENTITY_ID] == defaults.get(CONF_ENTITY_ID):
-                    mapping = {**defaults, **mapping}
-                self._property_draft = mapping
-                return await self.async_step_property_details()
-            defaults = user_input
-        return self._question("property_entity", {
-            vol.Required(CONF_ENTITY_ID): self._entity_selector(self._source_domains(prop), device_only=not self._all_entities),
-        }, defaults, self._property_placeholders(), errors)
+                reference = user_input.get(CONF_ENTITY_ID)
+                ids = self._eligible_entities(prop, allow_other=allow_other, current=defaults)
+                if not reference:
+                    errors[CONF_ENTITY_ID if ids else "base"] = "select_entity" if ids else "no_compatible_entity"
+                    defaults = {**defaults, **user_input}
+                else:
+                    mapping, error = _entity_mapping(self.hass, reference, self._source_domains(prop))
+                    if not error and mapping[CONF_ENTITY_ID] not in ids:
+                        error = "incompatible_entity"
+                    if error:
+                        errors[CONF_ENTITY_ID] = error
+                    else:
+                        if mapping[CONF_ENTITY_ID] == defaults.get(CONF_ENTITY_ID):
+                            mapping = {**defaults, **mapping}
+                        self._property_draft = mapping
+                        return await self.async_step_property_details()
+                    defaults = user_input
+        ids = self._eligible_entities(prop, allow_other=allow_other, current=self._property_draft)
+        schema = {}
+        if ids:
+            schema[vol.Optional(CONF_ENTITY_ID)] = self._property_entity_selector(prop, ids)
+        if self._argument_property is None:
+            schema[vol.Optional(CONF_USE_OTHER_ENTITIES, default=allow_other)] = selector.BooleanSelector()
+            defaults[CONF_USE_OTHER_ENTITIES] = allow_other
+        return self._question("property_entity", schema, defaults, self._property_placeholders(), errors)
 
     async def async_step_property_details(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         prop = self._current_property()
@@ -542,11 +632,11 @@ class _ModelMappingFlow:
         can_map_states = bool(prop.choices) or bool(mapping.get(CONF_VALUE_MAP)) or domain in {"select", "input_select"}
         map_default = bool(mapping.get(CONF_VALUE_MAP)) or domain in {"select", "input_select"} or binary_enum
         defaults = {**mapping, CONF_CONFIGURE_VALUE_MAP: map_default}
-        if attribute := effective_attribute(prop, entity_id, mapping):
-            defaults.setdefault(CONF_ATTRIBUTE, attribute)
         schema = {vol.Optional(CONF_ATTRIBUTE): selector.AttributeSelector({"entity_id": entity_id})}
         if prop.type_code == 0 or prop.semantic == "presence" or (prop.choices and all(value in (0, 1) for value, _ in prop.choices)):
-            schema[vol.Optional(CONF_INVERT, default=False)] = selector.BooleanSelector()
+            invert_default = mapping.get(CONF_INVERT, prop.semantic == "contact" and not mapping.get(CONF_VALUE_MAP))
+            defaults[CONF_INVERT] = invert_default
+            schema[vol.Optional(CONF_INVERT, default=invert_default)] = selector.BooleanSelector()
         if can_map_states:
             schema[vol.Optional(CONF_CONFIGURE_VALUE_MAP, default=map_default)] = selector.BooleanSelector()
         errors: dict[str, str] = {}
@@ -565,7 +655,7 @@ class _ModelMappingFlow:
                 if configure_states and can_map_states:
                     self._property_draft = mapping
                     state = self.hass.states.get(entity_id)
-                    effective = effective_attribute(prop, entity_id, mapping)
+                    effective = effective_attribute(prop, entity_id, mapping, state)
                     options = state.attributes.get("options", []) if state else []
                     raw = state.attributes.get(effective) if state and effective else (state.state if state else None)
                     self._map_states = list(dict.fromkeys([
@@ -636,9 +726,11 @@ class _ModelMappingFlow:
         return await self.async_step_property_source()
 
     async def async_step_features(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
-        options = ["finish"]
-        if self._properties:
+        options = ["settings", "finish"]
+        if self._ordinary_properties():
             options.insert(0, "properties")
+        if any(self._auto_managed(prop) for prop in self._public_properties()):
+            options.insert(-1, "default_properties")
         if self._model.actions:
             options.insert(-1, "actions")
         if self._model.events:
@@ -646,90 +738,169 @@ class _ModelMappingFlow:
         return self.async_show_menu(step_id="features", menu_options=options,
                                     description_placeholders={"model": self._model.name})
 
+    async def async_step_settings(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        defaults = {CONF_NAME: self._data.get(CONF_NAME, _device_name(self.hass, self._data.get(CONF_SOURCE_DEVICE))),
+                    CONF_ADAPTER: self._data.get(CONF_ADAPTER, DEFAULT_ADAPTER)}
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            adapter = user_input.get(CONF_ADAPTER, defaults[CONF_ADAPTER])
+            name = user_input.get(CONF_NAME, defaults[CONF_NAME])
+            if not isinstance(adapter, str) or re.fullmatch(r"hci[0-9]+", adapter) is None:
+                errors[CONF_ADAPTER] = "invalid_adapter"
+            if not isinstance(name, str):
+                errors[CONF_NAME] = "invalid_name"
+            if not errors:
+                self._data.update({CONF_ADAPTER: adapter, CONF_NAME: name.strip() or defaults[CONF_NAME]})
+                return await self.async_step_features()
+            defaults = user_input
+        return self._question("settings", {vol.Optional(CONF_NAME): selector.TextSelector(),
+                                           vol.Optional(CONF_ADAPTER, default=defaults[CONF_ADAPTER]): selector.TextSelector()}, defaults, {}, errors)
+
     async def async_step_actions(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         self._action_index = 0
         return await self.async_step_action()
 
     async def async_step_action(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        return await self._action_form(user_input, advanced=False)
+
+    async def async_step_action_advanced(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        return await self._action_form(user_input, advanced=True)
+
+    async def _action_form(self, user_input: dict[str, Any] | None, *, advanced: bool) -> ConfigFlowResult:
         if self._action_index >= len(self._model.actions):
             return await self.async_step_features()
         action = self._model.actions[self._action_index]
-        defaults = self._resolved(self._data[CONF_ACTION_MAPPINGS].get(action.key, {CONF_SOURCE: SOURCE_VIRTUAL}))
+        current = self._resolved(self._action_draft if advanced else self._data[CONF_ACTION_MAPPINGS].get(action.key, {}))
+        allow_other = bool(current.get(CONF_USE_OTHER_ENTITIES)) if advanced else False
+        previous_allow_other = allow_other
+        if advanced and user_input is not None:
+            allow_other = bool(user_input.get(CONF_USE_OTHER_ENTITIES, allow_other))
+            if allow_other != previous_allow_other:
+                self._action_draft = {**current, **user_input, CONF_USE_OTHER_ENTITIES: allow_other}
+                if CONF_ENTITY_ID in user_input and user_input[CONF_ENTITY_ID] != current.get(CONF_ENTITY_ID):
+                    self._action_draft.pop(CONF_ENTITY_REGISTRY_ID, None)
+                return await self.async_step_action_advanced()
+        ids = eligible_action_entities(self.hass, self._model, self._data.get(CONF_SOURCE_DEVICE), allow_other=allow_other)
+        current_id = current.get(CONF_ENTITY_ID)
+        existing_other = bool(current_id) and current_id not in ids
+        if existing_other and current.get(CONF_SOURCE) == SOURCE_ENTITY:
+            ids = [*ids, current_id]
+        defaults = {CONF_ENTITY_ID: current_id or (ids[0] if len(ids) == 1 else None),
+                    CONF_USE_VIRTUAL: current.get(CONF_USE_VIRTUAL, current.get(CONF_SOURCE) == SOURCE_VIRTUAL),
+                    CONF_ADVANCED: existing_other, CONF_USE_OTHER_ENTITIES: allow_other}
         errors: dict[str, str] = {}
         if user_input is not None:
-            source = user_input.get(CONF_SOURCE)
-            if source == SOURCE_VIRTUAL:
+            if not advanced and user_input.get(CONF_ADVANCED, defaults[CONF_ADVANCED]):
+                self._action_draft = {**current, **user_input, CONF_USE_OTHER_ENTITIES: existing_other}
+                if CONF_ENTITY_ID in user_input and user_input[CONF_ENTITY_ID] != current_id:
+                    self._action_draft.pop(CONF_ENTITY_REGISTRY_ID, None)
+                return await self.async_step_action_advanced()
+            if user_input.get(CONF_USE_VIRTUAL, defaults[CONF_USE_VIRTUAL]):
                 mapping = {CONF_SOURCE: SOURCE_VIRTUAL}
-            elif source == SOURCE_ENTITY:
-                mapping, error = _entity_mapping(self.hass, user_input.get(CONF_ENTITY_ID), _ACTION_DOMAINS)
-                if error:
-                    errors[CONF_ENTITY_ID] = error
             else:
-                errors[CONF_SOURCE] = "invalid_source"
+                mapping, error = _entity_mapping(self.hass, user_input.get(CONF_ENTITY_ID), _ACTION_DOMAINS)
+                if not error and mapping[CONF_ENTITY_ID] not in ids:
+                    error = "incompatible_entity"
+                if error:
+                    if not (advanced and CONF_USE_OTHER_ENTITIES in user_input and not user_input.get(CONF_ENTITY_ID)):
+                        errors[CONF_ENTITY_ID if ids else "base"] = error
             if not errors:
-                self._data[CONF_ACTION_MAPPINGS][action.key] = mapping
-                self._action_index += 1
-                return await self.async_step_action()
-            defaults = user_input
-        return self._question("action", {
-            vol.Required(CONF_SOURCE): selector.SelectSelector({"options": [
-                {"value": SOURCE_VIRTUAL, "label": "当前米家设备的虚拟动作"},
-                {"value": SOURCE_ENTITY, "label": "执行 HA 按钮、脚本或自动化"},
-            ]}),
-            vol.Optional(CONF_ENTITY_ID): self._entity_selector(_ACTION_DOMAINS),
-        }, defaults, {"action": action.name}, errors)
+                if mapping:
+                    self._data[CONF_ACTION_MAPPINGS][action.key] = mapping
+                    self._action_index += 1
+                    self._action_draft = {}
+                    return await self.async_step_action()
+            defaults.update(user_input)
+        schema = {}
+        if ids:
+            schema[vol.Optional(CONF_ENTITY_ID)] = selector.EntitySelector({"include_entities": ids, "filter": {"domain": sorted(_ACTION_DOMAINS)}})
+        schema[vol.Optional(CONF_USE_VIRTUAL, default=defaults[CONF_USE_VIRTUAL])] = selector.BooleanSelector()
+        field = CONF_USE_OTHER_ENTITIES if advanced else CONF_ADVANCED
+        schema[vol.Optional(field, default=defaults[field])] = selector.BooleanSelector()
+        return self._question("action_advanced" if advanced else "action", schema, defaults, {"action": action.name}, errors)
 
     async def async_step_events(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         self._event_index = 0
         return await self.async_step_event()
 
     async def async_step_event(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        return await self._event_form(user_input, advanced=False)
+
+    async def async_step_event_advanced(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        return await self._event_form(user_input, advanced=True)
+
+    async def _event_form(self, user_input: dict[str, Any] | None, *, advanced: bool) -> ConfigFlowResult:
         if self._event_index >= len(self._model.events):
             return await self.async_step_features()
         event = self._model.events[self._event_index]
-        defaults = self._resolved(self._data[CONF_EVENT_MAPPINGS].get(event.key, {CONF_SOURCE: SOURCE_DISABLED}))
-        defaults.setdefault(CONF_TRIGGER_VALUE, "on")
-        defaults[CONF_CUSTOM_ARGUMENTS] = bool(defaults.get(CONF_ARGUMENTS))
+        current = self._resolved(self._event_source_draft if advanced else self._data[CONF_EVENT_MAPPINGS].get(event.key, {}))
+        allow_other = bool(current.get(CONF_USE_OTHER_ENTITIES)) if advanced else False
+        previous_allow_other = allow_other
+        if advanced and user_input is not None:
+            allow_other = bool(user_input.get(CONF_USE_OTHER_ENTITIES, allow_other))
+            if allow_other != previous_allow_other:
+                self._event_source_draft = {**current, **user_input, CONF_USE_OTHER_ENTITIES: allow_other}
+                if CONF_ENTITY_ID in user_input and user_input[CONF_ENTITY_ID] != current.get(CONF_ENTITY_ID):
+                    self._event_source_draft.pop(CONF_ENTITY_REGISTRY_ID, None)
+                return await self.async_step_event_advanced()
+        ids = eligible_event_entities(self.hass, self._model, self._data.get(CONF_SOURCE_DEVICE), allow_other=allow_other)
+        current_id = current.get(CONF_ENTITY_ID)
+        existing_other = bool(current_id) and current_id not in ids
+        if existing_other and current.get(CONF_SOURCE) == SOURCE_ENTITY:
+            ids = [*ids, current_id]
+        defaults = {**current, CONF_ENTITY_ID: current_id or (ids[0] if len(ids) == 1 else None),
+                    CONF_ENABLED: current.get(CONF_ENABLED, current.get(CONF_SOURCE) == SOURCE_ENTITY or (not current and self._model.category == "button")),
+                    CONF_ADVANCED: existing_other, CONF_USE_OTHER_ENTITIES: allow_other,
+                    CONF_TRIGGER_VALUE: current.get(CONF_TRIGGER_VALUE, ""),
+                    CONF_CUSTOM_ARGUMENTS: current.get(CONF_CUSTOM_ARGUMENTS, bool(current.get(CONF_ARGUMENTS)))}
         errors: dict[str, str] = {}
         if user_input is not None:
-            source = user_input.get(CONF_SOURCE)
-            if source == SOURCE_DISABLED:
+            if not advanced and user_input.get(CONF_ADVANCED, defaults[CONF_ADVANCED]):
+                self._event_source_draft = {**current, **user_input, CONF_USE_OTHER_ENTITIES: existing_other}
+                if CONF_ENTITY_ID in user_input and user_input[CONF_ENTITY_ID] != current_id:
+                    self._event_source_draft.pop(CONF_ENTITY_REGISTRY_ID, None)
+                return await self.async_step_event_advanced()
+            if not user_input.get(CONF_ENABLED, defaults[CONF_ENABLED]):
                 self._data[CONF_EVENT_MAPPINGS].pop(event.key, None)
                 self._event_index += 1
+                self._event_source_draft = {}
                 return await self.async_step_event()
-            if source != SOURCE_ENTITY:
-                errors[CONF_SOURCE] = "invalid_source"
+            mapping, error = _entity_mapping(self.hass, user_input.get(CONF_ENTITY_ID), _EVENT_DOMAINS)
+            if not error and mapping[CONF_ENTITY_ID] not in ids:
+                error = "incompatible_entity"
+            trigger = user_input.get(CONF_TRIGGER_VALUE, defaults[CONF_TRIGGER_VALUE]) if advanced else defaults[CONF_TRIGGER_VALUE]
+            if error:
+                if not (advanced and CONF_USE_OTHER_ENTITIES in user_input and not user_input.get(CONF_ENTITY_ID)):
+                    errors[CONF_ENTITY_ID if ids else "base"] = error
+            elif not isinstance(trigger, str):
+                errors[CONF_TRIGGER_VALUE] = "invalid_state_value"
             else:
-                mapping, error = _entity_mapping(self.hass, user_input.get(CONF_ENTITY_ID), _EVENT_DOMAINS)
-                trigger = user_input.get(CONF_TRIGGER_VALUE, "")
-                if error:
-                    errors[CONF_ENTITY_ID] = error
-                elif not isinstance(trigger, str):
-                    errors[CONF_TRIGGER_VALUE] = "invalid_state_value"
-                else:
-                    if split_entity_id(mapping[CONF_ENTITY_ID])[0] in {"button", "input_button", "event"} and trigger == "on":
-                        trigger = ""
-                    mapping[CONF_TRIGGER_VALUE] = trigger
-                    self._event_draft = mapping
-                    if user_input.get(CONF_CUSTOM_ARGUMENTS) and event.argument_keys:
-                        self._event_draft[CONF_ARGUMENTS] = deepcopy(defaults.get(CONF_ARGUMENTS, {}))
-                        self._argument_index = 0
-                        return await self.async_step_event_argument()
-                    self._data[CONF_EVENT_MAPPINGS][event.key] = mapping
-                    self._event_index += 1
-                    return await self.async_step_event()
-            defaults = user_input
-        schema = {
-            vol.Required(CONF_SOURCE): selector.SelectSelector({"options": [
-                {"value": SOURCE_DISABLED, "label": "不转发此事件"},
-                {"value": SOURCE_ENTITY, "label": "由 HA 实体状态变化触发"},
-            ]}),
-            vol.Optional(CONF_ENTITY_ID): self._entity_selector(_EVENT_DOMAINS),
-            vol.Optional(CONF_TRIGGER_VALUE): selector.TextSelector(),
-        }
-        if event.argument_keys:
-            schema[vol.Optional(CONF_CUSTOM_ARGUMENTS, default=False)] = selector.BooleanSelector()
-        return self._question("event", schema, defaults, {"event": event.name}, errors)
+                if split_entity_id(mapping[CONF_ENTITY_ID])[0] in {"button", "input_button", "event"} and trigger == "on":
+                    trigger = ""
+                mapping[CONF_TRIGGER_VALUE] = trigger
+                self._event_draft = mapping
+                if advanced and user_input.get(CONF_CUSTOM_ARGUMENTS, defaults[CONF_CUSTOM_ARGUMENTS]) and event.argument_keys:
+                    self._event_draft[CONF_ARGUMENTS] = deepcopy(current.get(CONF_ARGUMENTS, {}))
+                    self._argument_index = 0
+                    return await self.async_step_event_argument()
+                if current.get(CONF_ARGUMENTS) and not advanced:
+                    mapping[CONF_ARGUMENTS] = deepcopy(current[CONF_ARGUMENTS])
+                self._data[CONF_EVENT_MAPPINGS][event.key] = mapping
+                self._event_index += 1
+                self._event_source_draft = {}
+                return await self.async_step_event()
+            defaults.update(user_input)
+        schema = {}
+        if ids:
+            schema[vol.Optional(CONF_ENTITY_ID)] = selector.EntitySelector({"include_entities": ids, "filter": {"domain": sorted(_EVENT_DOMAINS)}})
+        schema[vol.Optional(CONF_ENABLED, default=defaults[CONF_ENABLED])] = selector.BooleanSelector()
+        field = CONF_USE_OTHER_ENTITIES if advanced else CONF_ADVANCED
+        schema[vol.Optional(field, default=defaults[field])] = selector.BooleanSelector()
+        if advanced:
+            schema[vol.Optional(CONF_TRIGGER_VALUE)] = selector.TextSelector()
+        if advanced and event.argument_keys:
+            schema[vol.Optional(CONF_CUSTOM_ARGUMENTS, default=defaults[CONF_CUSTOM_ARGUMENTS])] = selector.BooleanSelector()
+        return self._question("event_advanced" if advanced else "event", schema, defaults, {"event": event.name}, errors)
 
     async def async_step_event_argument(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         event = self._model.events[self._event_index]
@@ -854,19 +1025,22 @@ class MiotBleBridgeConfigFlow(_ModelMappingFlow, ConfigFlow, domain=DOMAIN):
         return MiotBleBridgeOptionsFlow()
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        categories = category_options()
         errors: dict[str, str] = {}
         if user_input is not None:
-            device_id = user_input.get(CONF_SOURCE_DEVICE)
-            if not isinstance(device_id, str) or dr.async_get(self.hass).async_get(device_id) is None:
-                errors[CONF_SOURCE_DEVICE] = "device_not_found"
+            category = user_input.get(CONF_DEVICE_TYPE)
+            if category not in {item["value"] for item in categories}:
+                errors[CONF_DEVICE_TYPE] = "invalid_device_type"
             else:
-                self._data[CONF_SOURCE_DEVICE] = device_id
+                self._data[CONF_DEVICE_TYPE] = category
                 return await self.async_step_model()
-        return self._question("user", {vol.Required(CONF_SOURCE_DEVICE): selector.DeviceSelector()},
+        return self._question("user", {vol.Required(CONF_DEVICE_TYPE): selector.SelectSelector({"options": categories, "mode": "dropdown"})},
                               user_input or {}, {}, errors)
 
     async def async_step_model(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
-        models = [item if hasattr(item, "model") else get_model(item) for item in AVAILABLE_MODELS]
+        if CONF_DEVICE_TYPE not in self._data:
+            return await self.async_step_user()
+        models = [model for model in AVAILABLE_MODELS if model.category == self._data[CONF_DEVICE_TYPE]]
         if not models:
             return self.async_abort(reason="no_available_models")
         errors: dict[str, str] = {}
@@ -874,32 +1048,35 @@ class MiotBleBridgeConfigFlow(_ModelMappingFlow, ConfigFlow, domain=DOMAIN):
             model_id = user_input.get(CONF_MODEL)
             if model_id not in {model.model for model in models}:
                 errors[CONF_MODEL] = "model_unavailable"
-            elif _device_model_already_mapped(self.hass, self._data[CONF_SOURCE_DEVICE], model_id):
-                errors[CONF_MODEL] = "device_model_already_mapped"
             else:
                 self._model = get_model(model_id)
-                return await self.async_step_settings()
+                return await self.async_step_device()
         return self._question("model", {vol.Required(CONF_MODEL): selector.SelectSelector({
             "options": [{"value": model.model, "label": model.name} for model in models],
             "mode": "dropdown",
-        })}, user_input or {CONF_MODEL: DEFAULT_MODEL}, {}, errors)
+        })}, user_input or {}, {}, errors)
 
-    async def async_step_settings(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
-        defaults = {CONF_NAME: _device_name(self.hass, self._data.get(CONF_SOURCE_DEVICE)), CONF_ADAPTER: DEFAULT_ADAPTER}
+    async def async_step_device(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        devices = eligible_devices(self.hass, self._model)
+        options = [item for item in devices if not _device_model_already_mapped(self.hass, item["value"], self._model.model)]
         errors: dict[str, str] = {}
         if user_input is not None:
-            adapter = user_input.get(CONF_ADAPTER, DEFAULT_ADAPTER)
-            name = user_input.get(CONF_NAME, "")
-            if not isinstance(adapter, str) or re.fullmatch(r"hci[0-9]+", adapter) is None:
-                errors[CONF_ADAPTER] = "invalid_adapter"
-            if not isinstance(name, str):
-                errors[CONF_NAME] = "invalid_name"
-            if not errors:
-                self._prepare({**self._data, CONF_ADAPTER: adapter, CONF_NAME: name.strip() or defaults[CONF_NAME]}, prefer_entities=True)
+            device_id = user_input.get(CONF_SOURCE_DEVICE)
+            if _device_model_already_mapped(self.hass, device_id, self._model.model):
+                errors[CONF_SOURCE_DEVICE] = "device_model_already_mapped"
+            elif device_id not in {item["value"] for item in options}:
+                errors[CONF_SOURCE_DEVICE] = "incompatible_device"
+            else:
+                self._prepare({**self._data, CONF_SOURCE_DEVICE: device_id,
+                               CONF_NAME: _device_name(self.hass, device_id), CONF_ADAPTER: DEFAULT_ADAPTER},
+                              prefer_entities=True)
                 return await self.async_step_properties()
-            defaults = user_input
-        return self._question("settings", {vol.Optional(CONF_NAME): selector.TextSelector(),
-                                           vol.Required(CONF_ADAPTER, default=DEFAULT_ADAPTER): selector.TextSelector()}, defaults, {}, errors)
+        schema = {}
+        if options:
+            schema[vol.Required(CONF_SOURCE_DEVICE)] = selector.SelectSelector({"options": options, "mode": "dropdown"})
+        elif not errors:
+            errors["base"] = "no_compatible_device"
+        return self._question("device", schema, user_input or {}, {}, errors)
 
     async def async_step_import(self, user_input: dict[str, Any]) -> ConfigFlowResult:
         if CONF_MODEL not in user_input and CONF_PROPERTY_MAPPINGS not in user_input:
@@ -950,6 +1127,8 @@ class MiotBleBridgeOptionsFlow(_ModelMappingFlow, OptionsFlowWithReload):
             original[CONF_MODEL] = self._model.model
             original[CONF_SOURCE_DEVICE] = _entry_device(self.hass, original)
             self._prepare(original)
+        if user_input is None:
+            return await self.async_step_properties()
         defaults = self._data
         errors: dict[str, str] = {}
         if user_input is not None:
@@ -971,7 +1150,6 @@ class MiotBleBridgeOptionsFlow(_ModelMappingFlow, OptionsFlowWithReload):
                 return await self.async_step_properties()
             defaults = {**self._data, **user_input}
         return self._question("init", {
-            vol.Optional(CONF_SOURCE_DEVICE): selector.DeviceSelector(),
             vol.Optional(CONF_NAME): selector.TextSelector(),
             vol.Required(CONF_ADAPTER, default=DEFAULT_ADAPTER): selector.TextSelector(),
         }, defaults, {}, errors)
