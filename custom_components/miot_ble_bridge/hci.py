@@ -1,8 +1,7 @@
-"""Android vendor advertising on a shared Linux Bluetooth controller.
+"""Vendor multi-instance and standard LE advertising on Linux.
 
-The vendor instances have their own on-air addresses. The standard advertising
-instance, scanning settings, adapter identity, and BlueZ remain untouched.
-Protocol reference: source.android.com/docs/core/connect/bluetooth/hci_requirements
+Vendor protocol reference:
+source.android.com/docs/core/connect/bluetooth/hci_requirements
 """
 
 from __future__ import annotations
@@ -25,6 +24,11 @@ _COMMAND_STATUS = 0x0F
 _DISCONNECTION_COMPLETE = 0x05
 _LE_META = 0x3E
 _VENDOR_EVENT = 0xFF
+_LE_SET_RANDOM_ADDRESS = 0x2005
+_LE_SET_ADVERTISING_PARAMETERS = 0x2006
+_LE_SET_ADVERTISING_DATA = 0x2008
+_LE_SET_SCAN_RESPONSE_DATA = 0x2009
+_LE_SET_ADVERTISING_ENABLE = 0x200A
 
 
 class HciError(Exception):
@@ -182,6 +186,8 @@ class _Instance:
     mac: str
     connectable: bool
     scan_response: bytes | None = None
+    interval: int = 0
+    data: bytes = b""
 
 
 class VendorAdvertiser:
@@ -219,6 +225,10 @@ class VendorAdvertiser:
         self._handle_instances: dict[int, int] = {}
         self.capabilities: Capabilities | None = None
 
+    @property
+    def usable_instances(self) -> tuple[int, ...]:
+        return self.capabilities.usable_instances if self.capabilities else ()
+
     def _open_socket(self) -> socket.socket:
         if not hasattr(socket, "AF_BLUETOOTH") or not hasattr(socket, "BTPROTO_HCI"):
             raise HciUnsupportedError("Raw HCI advertising requires Linux Bluetooth sockets")
@@ -228,7 +238,8 @@ class VendorAdvertiser:
             controller.bind((self._adapter_index,))
             events_low = (1 << _DISCONNECTION_COMPLETE) | (1 << _COMMAND_COMPLETE) | (1 << _COMMAND_STATUS)
             events_high = (1 << (_LE_META - 32)) | (1 << 31)
-            controller.setsockopt(0, 2, struct.pack("<IIIH", 1 << _EVENT_PACKET, events_low, events_high, 0))
+            # Linux aligns struct hci_filter to a four-byte boundary.
+            controller.setsockopt(0, 2, struct.pack("=IIIH2x", 1 << _EVENT_PACKET, events_low, events_high, 0))
         except BaseException:
             controller.close()
             raise
@@ -247,16 +258,8 @@ class VendorAdvertiser:
             if self.capabilities is not None:
                 return self.capabilities
             raise HciError("HCI transport is already starting")
-        await self._join_tasks()
-        self._failure = None
-        self._stopping = False
         self.capabilities = None
-        try:
-            self._socket = self._open_socket()
-        except OSError as err:
-            raise HciError(f"Unable to open {self.adapter} raw HCI socket: {err}") from err
-        self._reader = asyncio.create_task(self._reader_loop(), name=f"miot-{self.adapter}-events")
-        self._worker = asyncio.create_task(self._command_loop(), name=f"miot-{self.adapter}-commands")
+        await self._async_start_transport()
         try:
             response = await self._command(HCI_VENDOR_CAPABILITIES)
             self.capabilities = decode_capabilities(response)
@@ -267,6 +270,17 @@ class VendorAdvertiser:
                 raise HciUnsupportedError("Controller does not implement Android vendor advertising") from err
             raise
         return self.capabilities
+
+    async def _async_start_transport(self) -> None:
+        await self._join_tasks()
+        self._failure = None
+        self._stopping = False
+        try:
+            self._socket = self._open_socket()
+        except OSError as err:
+            raise HciError(f"Unable to open {self.adapter} raw HCI socket: {err}") from err
+        self._reader = asyncio.create_task(self._reader_loop(), name=f"miot-{self.adapter}-events")
+        self._worker = asyncio.create_task(self._command_loop(), name=f"miot-{self.adapter}-commands")
 
     async def _command(
         self, opcode: int, payload: bytes = b"", subcommand: int | None = None,
@@ -397,7 +411,7 @@ class VendorAdvertiser:
         self._worker = None
 
     def _require_instance(self, instance: int) -> None:
-        if self.capabilities is None or instance not in self.capabilities.usable_instances:
+        if instance not in self.usable_instances:
             raise HciUnsupportedError(f"Advertising instance {instance} is unavailable")
 
     async def async_configure(
@@ -466,3 +480,87 @@ class VendorAdvertiser:
             self._handle_instances.clear()
         if first_error is not None:
             raise first_error
+
+
+class LegacyAdvertiser(VendorAdvertiser):
+    """Reuse the standard advertiser for one static random identity at a time."""
+
+    @property
+    def usable_instances(self) -> tuple[int, ...]:
+        # Software identifiers. Only one is programmed on the controller.
+        return tuple(range(1, 255))
+
+    async def async_start(self) -> None:
+        if self._socket is None:
+            await self._async_start_transport()
+            # Clear the standard advertiser after the BlueZ ownership check.
+            await self._async_disable_radio()
+
+    async def async_configure(
+        self, instance: int, mac: str, connectable: bool, interval_ms: float = 100,
+        tx_power: int = 0,
+    ) -> None:
+        self._require_instance(instance)
+        # Use the common static address and interval validation.
+        parameters = advertising_parameters(instance, mac, connectable, interval_ms, tx_power)
+        if instance in self._enabled:
+            await self.async_disable(instance)
+        self._instances[instance] = _Instance(
+            mac.upper(), connectable, interval=struct.unpack_from("<H", parameters, 1)[0],
+        )
+
+    async def async_set_data(self, instance: int, data: bytes, scan_response: bytes = b"") -> None:
+        config = self._instances[instance]
+        data = advertising_data(instance, data)[1:-1]
+        scan = advertising_data(instance, scan_response, scan_response=True)[1:-1]
+        if instance in self._enabled:
+            await self._command(_LE_SET_ADVERTISING_DATA, data)
+            if config.scan_response != scan:
+                await self._command(_LE_SET_SCAN_RESPONSE_DATA, scan)
+        config.data = data
+        config.scan_response = scan
+
+    async def async_enable(self, instance: int) -> None:
+        config = self._instances[instance]
+        async with self._enable_lock:
+            if self._enabled:
+                raise HciError("The standard advertiser already has an active identity")
+            if not config.data or config.scan_response is None:
+                raise HciError("Set advertising data before enabling the standard advertiser")
+            await self._command(_LE_SET_RANDOM_ADDRESS, _address_bytes(config.mac))
+            params = struct.pack(
+                "<HHBB7xBB", config.interval, config.interval,
+                0x00 if config.connectable else 0x02, 0x01, 0x07, 0x00,
+            )
+            await self._command(_LE_SET_ADVERTISING_PARAMETERS, params)
+            await self._command(_LE_SET_ADVERTISING_DATA, config.data)
+            await self._command(_LE_SET_SCAN_RESPONSE_DATA, config.scan_response)
+            self._enabled.add(instance)
+            try:
+                await self._command(_LE_SET_ADVERTISING_ENABLE, b"\x01")
+            except HciCommandError:
+                self._enabled.discard(instance)
+                raise
+
+    async def async_disable(self, instance: int) -> None:
+        if instance in self._enabled:
+            await self._async_disable_radio()
+            self._enabled.discard(instance)
+
+    async def _async_disable_radio(self) -> None:
+        try:
+            await self._command(
+                _LE_SET_ADVERTISING_ENABLE, b"\x00", stopping_cleanup=self._stopping,
+            )
+        except HciCommandError as error:
+            # Some Broadcom controllers report Command Disallowed when already idle.
+            if error.status != 0x0C:
+                raise
+
+    def _dispatch_event(self, event: BluetoothEvent) -> None:
+        if event.kind == "connected":
+            if event.role != 1 or not any(self._instances[slot].connectable for slot in self._enabled):
+                return
+        elif event.kind != "disconnected" or event.handle not in self._handle_instances:
+            return
+        super()._dispatch_event(event)

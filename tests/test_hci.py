@@ -60,6 +60,47 @@ class SimulatedAdvertiser(hci.VendorAdvertiser):
             self.incoming.put_nowait(response)
 
 
+class SimulatedLegacyAdvertiser(SimulatedAdvertiser, hci.LegacyAdvertiser):
+    pass
+
+
+class LegacyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_switches_addresses_only_with_advertising_disabled(self):
+        events = []
+        controller = SimulatedLegacyAdvertiser(event_callback=events.append)
+        await controller.async_start()
+        try:
+            await controller.async_configure(1, "D4:3B:04:5E:2A:10", False)
+            await controller.async_configure(2, "D4:3B:04:5E:2A:11", True)
+            await controller.async_set_data(1, b"first", b"scan first")
+            await controller.async_set_data(2, b"second", b"scan second")
+            await controller.async_enable(1)
+            central = hci.BluetoothEvent("connected", handle=100, role=0, status=0)
+            peripheral = hci.BluetoothEvent("connected", handle=101, role=1, status=0)
+            controller._dispatch_event(central)
+            controller._dispatch_event(peripheral)
+            self.assertEqual(events, [])
+            with self.assertRaises(hci.HciError):
+                await controller.async_enable(2)
+            await controller.async_disable(1)
+            await controller.async_enable(2)
+            controller._dispatch_event(peripheral)
+            controller._dispatch_event(hci.BluetoothEvent("disconnected", handle=101, status=0))
+            self.assertEqual([event.instance for event in events], [2, 2])
+        finally:
+            await controller.async_stop()
+
+        commands = [(struct.unpack_from("<H", packet, 1)[0], packet[4:]) for packet in controller.sent]
+        opcodes, payloads = zip(*commands)
+        sequence = (0x200A, 0x2005, 0x2006, 0x2008, 0x2009, 0x200A)
+        self.assertEqual(opcodes, sequence * 2 + (0x200A,))
+        self.assertEqual(payloads[1], bytes.fromhex("102a5e043bd4"))
+        self.assertEqual(payloads[7], bytes.fromhex("112a5e043bd4"))
+        self.assertEqual(payloads[2][4:6], b"\x02\x01")
+        self.assertEqual(payloads[8][4:6], b"\x00\x01")
+        self.assertEqual(payloads[-1], b"\x00")
+
+
 class PacketTests(unittest.TestCase):
     def test_independent_static_address_parameters(self):
         actual = hci.advertising_parameters(15, "C2:A1:55:00:00:0F", False)

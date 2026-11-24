@@ -34,7 +34,7 @@ from .const import (
     STATUS_SOURCE_OFFLINE,
     STATUS_UNPAIRED,
 )
-from .hci import BluetoothEvent, HciError, VendorAdvertiser
+from .hci import BluetoothEvent, HciError, HciUnsupportedError, LegacyAdvertiser, VendorAdvertiser
 from .mappings import action_service_call, default_mappings, property_service_call, read_entity_value
 from .models import DEFAULT_MODEL, get_model
 from .protocol import CounterLease, MiotProtocol, ProtocolError
@@ -46,6 +46,7 @@ _ABSENT_MINUTES = 0x4852
 _PRESENT_MINUTES = 0x4851
 _BATTERY = 0x100A
 _PAIRING_SECONDS = 300
+_LEGACY_DWELL = 1.3
 
 
 def advertising_payload(service_data: bytes) -> bytes:
@@ -177,6 +178,7 @@ class RadarRuntime:
             "model": self.model.model,
             "battery_percentage": 100,
             "advertising_instance": self.instance,
+            "advertising_mode": self.manager.advertising_mode,
             "att_mtu": getattr(self.manager.server, "att_mtu", None) if (self.manager.pairing or self.manager.connection_target) is self else None,
             "source_available": self._source_available,
             "presence": self._presence,
@@ -624,6 +626,7 @@ class BridgeManager:
         self.connection_target: RadarRuntime | None = None
         self._connection_rotation = 0
         self._selection_deadline = 0.0
+        self._legacy_target: RadarRuntime | None = None
         self._incoming_pending = False
         self.connection_handle: int | None = None
         self._peer_address: str | None = None
@@ -640,21 +643,35 @@ class BridgeManager:
         self.wakeup = asyncio.Event()
 
     async def async_start(self) -> None:
-        await self.advertiser.async_start()
+        await self._async_start_bluetooth()
+        self._task = self.hass.async_create_background_task(self._run(), f"{DOMAIN} {self.adapter}")
+
+    @property
+    def advertising_mode(self) -> str:
+        return "legacy_rotation" if isinstance(self.advertiser, LegacyAdvertiser) else "vendor_multi"
+
+    async def _async_start_bluetooth(self) -> None:
+        try:
+            await self.advertiser.async_start()
+        except HciUnsupportedError as error:
+            self.advertiser = LegacyAdvertiser(self.adapter, event_callback=self._hci_event)
+            _LOGGER.info("%s using legacy advertising rotation: %s", self.adapter, error)
         try:
             await self.server.async_start()
+            if isinstance(self.advertiser, LegacyAdvertiser):
+                await self.server.async_require_idle_advertising()
+                await self.advertiser.async_start()
         except BaseException:
-            await self.advertiser.async_stop()
+            try:
+                await self.advertiser.async_stop()
+            finally:
+                await self.server.async_stop()
             raise
-        self._task = self.hass.async_create_background_task(self._run(), f"{DOMAIN} {self.adapter}")
 
     async def async_add(self, runtime: RadarRuntime) -> None:
         async with self._operation_lock:
-            capabilities = self.advertiser.capabilities
-            if capabilities is None:
-                raise HciError("Bluetooth capabilities are unavailable")
             used = {target.instance for target in self.targets.values()}
-            available = [slot for slot in capabilities.usable_instances if slot not in used]
+            available = [slot for slot in self.advertiser.usable_instances if slot not in used]
             if not available:
                 raise HciError("No independent Bluetooth advertising instance remains")
             if any(target.mac == runtime.mac for target in self.targets.values()):
@@ -688,6 +705,9 @@ class BridgeManager:
                 runtime.stop_subscriptions()
                 runtime.protocol.disconnect()
                 self.targets.pop(runtime.device_id, None)
+                if self._legacy_target is runtime:
+                    self._legacy_target = None
+                    self._selection_deadline = 0.0
                 if self.connection_target is runtime:
                     self.connection_target = None
                     self._selection_deadline = 0.0
@@ -700,6 +720,10 @@ class BridgeManager:
                 await self._async_end_pairing()
             elif self.connection_target is not None:
                 await self._async_close_connection_target()
+            if self._legacy_target is not None:
+                await self.advertiser.async_disable(self._legacy_target.instance)
+                self._legacy_target._enabled = False
+                self._legacy_target = None
             self._notifications.clear()
             self.server.reset_session()
             self.pairing = runtime
@@ -711,6 +735,44 @@ class BridgeManager:
             await self._async_publish(runtime, time.monotonic())
             runtime.notify_listeners()
             self.wakeup.set()
+
+    async def _async_publish_legacy(self, now: float) -> None:
+        if self.connection_handle is not None or self._incoming_pending:
+            return
+        if self.pairing is not None:
+            await self._async_publish(self.pairing, now)
+            return
+
+        candidates = [
+            target for target in self.targets.values()
+            if target.bound and target._source_available and not target._error
+        ]
+        previous = self._legacy_target
+        if previous in candidates and now < self._selection_deadline:
+            return
+        if previous in candidates:
+            selected = candidates[(candidates.index(previous) + 1) % len(candidates)]
+        else:
+            selected = candidates[0] if candidates else None
+        if previous is not selected and previous is not None:
+            await self.advertiser.async_disable(previous.instance)
+            previous._enabled = False
+            if self._incoming_pending:
+                return
+
+        self._legacy_target = selected
+        if selected is None:
+            self.connection_target = None
+            return
+        if selected is not previous or (selected.model.connectable and self.connection_target is None):
+            self.connection_target = selected if selected.model.connectable else None
+            await self.advertiser.async_configure(
+                selected.instance, selected.mac, selected.model.connectable, interval_ms=100,
+            )
+            selected._enabled = False
+        selected._next_publication = 0.0
+        await self._async_publish(selected, now)
+        self._selection_deadline = time.monotonic() + (3.0 if selected.model.connectable else _LEGACY_DWELL)
 
     async def async_end_pairing(self) -> None:
         async with self._operation_lock:
@@ -947,6 +1009,7 @@ class BridgeManager:
         async with self._operation_lock:
             self.pairing = None
             self.connection_target = None
+            self._legacy_target = None
             self._selection_deadline = 0.0
             self._incoming_pending = False
             self.connection_handle = None
@@ -960,8 +1023,7 @@ class BridgeManager:
             self.server = BlueZServer(self.adapter, self._write_gatt, self._read_gatt)
             self.server.subscription_callback = self._notify_channels_changed
             self.server.mtu_callback = self._mtu_changed
-            await self.advertiser.async_start()
-            await self.server.async_start()
+            await self._async_start_bluetooth()
             for runtime in self.targets.values():
                 runtime.protocol.disconnect()
                 await self.advertiser.async_configure(runtime.instance, runtime.mac, False, interval_ms=400)
@@ -981,7 +1043,9 @@ class BridgeManager:
                     if self.pairing and now >= self._pair_deadline:
                         await self.async_end_pairing()
                     async with self._operation_lock:
-                        await self._async_select_connection(now)
+                        legacy = isinstance(self.advertiser, LegacyAdvertiser)
+                        if not legacy:
+                            await self._async_select_connection(now)
                         runtime = self.pairing or self.connection_target
                         if runtime and self.connection_handle is not None:
                             runtime.protocol.poll(now)
@@ -989,7 +1053,10 @@ class BridgeManager:
                             self._flush_notifications(runtime)
                         for runtime in tuple(self.targets.values()):
                             runtime.update_duration(now)
-                            await self._async_publish(runtime, now)
+                            if not legacy:
+                                await self._async_publish(runtime, now)
+                        if legacy:
+                            await self._async_publish_legacy(now)
             except (HciError, OSError, DBusError, ProtocolError, RuntimeError, ValueError) as error:
                 self._failed(error)
             self.wakeup.clear()

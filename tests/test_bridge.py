@@ -113,7 +113,7 @@ class FakeEntry:
 
 class FakeAdvertiser:
     def __init__(self):
-        self.capabilities = SimpleNamespace(usable_instances=tuple(range(1, 16)))
+        self.usable_instances = tuple(range(1, 16))
         self.configured = []
         self.disabled = []
         self.enabled = []
@@ -634,6 +634,49 @@ class ModelConnectionTests(BridgeTestCase):
         self.assertIn(b"\x16\x95\xfe"+payload, packet)
         with self.assertRaises(ValueError):
             bridge.advertising_payload(bytes(25))
+
+    async def test_legacy_rotation_waits_for_pairing_and_resumes_after_disconnect(self):
+        first = self.model_runtime("MUE4094RT", entry_id="first")
+        second = self.model_runtime("MUE4094RT", entry_id="second", mac="D4:3B:04:5E:2A:11")
+        first.instance, second.instance = 1, 2
+        self.manager.targets = {first.device_id: first, second.device_id: second}
+
+        with patch.object(bridge.time, "monotonic", return_value=100):
+            await self.manager._async_publish_legacy(100)
+        await self.manager._async_publish_legacy(101)
+        self.assertEqual(self.manager.advertiser.enabled, [1])
+        with patch.object(bridge.time, "monotonic", return_value=104):
+            await self.manager._async_publish_legacy(104)
+            await self.manager.async_start_pairing(first)
+        self.assertEqual(self.manager.advertiser.enabled, [1, 2, 1])
+        await self.manager._async_process_hci_event(
+            first, bridge.BluetoothEvent("connected", instance=1, handle=0x123, role=1, status=0),
+        )
+        await self.manager._async_publish_legacy(110)
+        self.assertEqual(self.manager.advertiser.enabled, [1, 2, 1])
+        await self.manager._async_process_hci_event(
+            first, bridge.BluetoothEvent("disconnected", instance=1, handle=0x123, status=0),
+        )
+        await self.manager._async_publish_legacy(111)
+        self.assertEqual(self.manager.advertiser.enabled, [1, 2, 1, 1])
+
+    async def test_only_unsupported_vendor_advertising_selects_legacy(self):
+        original = self.manager.advertiser
+        original.async_start = AsyncMock()
+        self.manager.server.async_require_idle_advertising = AsyncMock()
+        with patch.object(bridge.LegacyAdvertiser, "async_start", new_callable=AsyncMock) as start:
+            await self.manager._async_start_bluetooth()
+            self.assertIs(self.manager.advertiser, original)
+            start.assert_not_awaited()
+            original.async_start.side_effect = bridge.HciError("timed out")
+            with self.assertRaises(bridge.HciError):
+                await self.manager._async_start_bluetooth()
+            start.assert_not_awaited()
+            original.async_start.side_effect = bridge.HciUnsupportedError("no vendor instances")
+            await self.manager._async_start_bluetooth()
+            self.assertEqual(self.manager.advertising_mode, "legacy_rotation")
+            self.manager.server.async_require_idle_advertising.assert_awaited_once()
+            start.assert_awaited_once()
 
 
 class NotificationTests(BridgeTestCase):

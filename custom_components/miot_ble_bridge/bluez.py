@@ -182,6 +182,7 @@ class BlueZServer:
         self.application = _Application(self)
         self.bus: MessageBus | None = None
         self.manager = None
+        self._adapter_properties = None
         self._registered = False
 
     async def async_start(self) -> None:
@@ -190,6 +191,7 @@ class BlueZServer:
             introspection = await self.bus.introspect("org.bluez", f"/org/bluez/{self.adapter}")
             proxy = self.bus.get_proxy_object("org.bluez", f"/org/bluez/{self.adapter}", introspection)
             self.manager = proxy.get_interface("org.bluez.GattManager1")
+            self._adapter_properties = proxy.get_interface("org.freedesktop.DBus.Properties")
             self.bus.export(self.path, self.application)
             for service in self.services:
                 self.bus.export(service.path, service)
@@ -201,6 +203,13 @@ class BlueZServer:
             self.bus.disconnect()
             self.bus = None
             raise
+
+    async def async_require_idle_advertising(self) -> None:
+        active = await asyncio.wait_for(
+            self._adapter_properties.call_get("org.bluez.LEAdvertisingManager1", "ActiveInstances"), 5,
+        )
+        if active.value:
+            raise RuntimeError(f"{self.adapter} already has BlueZ advertisements on the standard advertiser")
 
     def notify(self, channel: int, value: bytes) -> bool:
         return self.characteristics[channel].notify(value)
@@ -248,3 +257,4 @@ class BlueZServer:
             self._registered = False
             self.bus.disconnect()
             self.bus = None
+            self._adapter_properties = None
