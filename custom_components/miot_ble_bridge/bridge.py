@@ -179,7 +179,7 @@ class RadarRuntime:
             "battery_percentage": 100,
             "advertising_instance": self.instance,
             "advertising_mode": self.manager.advertising_mode,
-            "att_mtu": getattr(self.manager.server, "att_mtu", None) if (self.manager.pairing or self.manager.connection_target) is self else None,
+            "att_mtu": getattr(self.manager.server, "att_mtu", None) if self.manager._current_runtime() is self else None,
             "source_available": self._source_available,
             "presence": self._presence,
             "illuminance": self._lux if self.illuminance_entity else None,
@@ -590,11 +590,14 @@ class RadarRuntime:
         self._next_publication = 0.0
         self.notify_listeners()
 
-    async def async_counter(self) -> int:
+    async def async_prepare_counter(self) -> None:
         reservation = self.counter.required_reservation()
         if reservation is not None:
             await self._async_save({"counter_reserved_until": reservation})
             self.counter.commit_reservation(reservation)
+
+    async def async_counter(self) -> int:
+        await self.async_prepare_counter()
         return self.counter.take()
 
     async def async_pair(self) -> None:
@@ -627,6 +630,7 @@ class BridgeManager:
         self._connection_rotation = 0
         self._selection_deadline = 0.0
         self._legacy_target: RadarRuntime | None = None
+        self._connection_owner: RadarRuntime | None = None
         self._incoming_pending = False
         self.connection_handle: int | None = None
         self._peer_address: str | None = None
@@ -659,7 +663,7 @@ class BridgeManager:
         try:
             await self.server.async_start()
             if isinstance(self.advertiser, LegacyAdvertiser):
-                await self.server.async_require_idle_advertising()
+                await self.server.async_require_idle_advertising(self.hass)
                 await self.advertiser.async_start()
         except BaseException:
             try:
@@ -696,6 +700,9 @@ class BridgeManager:
             try:
                 if self.pairing is runtime:
                     await self._async_end_pairing()
+                elif self._connection_owner is runtime:
+                    self.connection_target = runtime
+                    await self._async_close_connection_target()
                 elif self.connection_target is runtime:
                     await self._async_close_connection_target()
                 await self.advertiser.async_disable(runtime.instance)
@@ -737,7 +744,7 @@ class BridgeManager:
             self.wakeup.set()
 
     async def _async_publish_legacy(self, now: float) -> None:
-        if self.connection_handle is not None or self._incoming_pending:
+        if self._legacy_connection_busy():
             return
         if self.pairing is not None:
             await self._async_publish(self.pairing, now)
@@ -754,25 +761,58 @@ class BridgeManager:
             selected = candidates[(candidates.index(previous) + 1) % len(candidates)]
         else:
             selected = candidates[0] if candidates else None
+        if selected is not None:
+            if not await self._async_prepare_legacy_counter(selected):
+                return
+            if self._legacy_connection_busy():
+                return
+            if not await self.server.async_check_legacy_occupancy(busy=self._legacy_connection_busy):
+                return
+            if self._legacy_connection_busy():
+                return
         if previous is not selected and previous is not None:
             await self.advertiser.async_disable(previous.instance)
             previous._enabled = False
-            if self._incoming_pending:
+            if self._legacy_connection_busy():
                 return
 
-        self._legacy_target = selected
         if selected is None:
+            self._legacy_target = None
             self.connection_target = None
             return
         if selected is not previous or (selected.model.connectable and self.connection_target is None):
-            self.connection_target = selected if selected.model.connectable else None
             await self.advertiser.async_configure(
                 selected.instance, selected.mac, selected.model.connectable, interval_ms=100,
             )
+            if self._legacy_connection_busy():
+                return
             selected._enabled = False
+        self._legacy_target = selected
+        self.connection_target = selected if selected.model.connectable else None
         selected._next_publication = 0.0
         await self._async_publish(selected, now)
         self._selection_deadline = time.monotonic() + (3.0 if selected.model.connectable else _LEGACY_DWELL)
+
+    def _legacy_connection_busy(self) -> bool:
+        return self._connection_owner is not None or self.connection_handle is not None or self._incoming_pending
+
+    def _current_runtime(self) -> RadarRuntime | None:
+        return self._connection_owner or self.pairing or self.connection_target
+
+    async def _async_prepare_legacy_counter(self, runtime: RadarRuntime) -> bool:
+        if not runtime.bound or runtime.model.auth_mode == "standard_nus":
+            return True
+        try:
+            await runtime.async_prepare_counter()
+        except (OSError, ValueError, ProtocolError) as error:
+            runtime._error = f"Identity persistence failed: {error}"
+            runtime.notify_listeners()
+            if runtime._enabled:
+                await self.advertiser.async_disable(runtime.instance)
+            runtime._enabled = False
+            _LOGGER.error("Encrypted advertising stopped for %s: %s", runtime.name, error)
+            return False
+        return True
 
     async def async_end_pairing(self) -> None:
         async with self._operation_lock:
@@ -846,7 +886,11 @@ class BridgeManager:
 
     @callback
     def _hci_event(self, event: BluetoothEvent) -> None:
-        runtime = self.pairing or self.connection_target
+        legacy = isinstance(self.advertiser, LegacyAdvertiser)
+        if legacy:
+            runtime = self._connection_owner if self._connection_owner is not None and self._connection_owner.instance == event.instance else next((target for target in self.targets.values() if target.instance == event.instance), None)
+        else:
+            runtime = self._current_runtime()
         if runtime is None or self._stopping:
             return
         if event.instance is not None and event.instance != runtime.instance:
@@ -855,11 +899,16 @@ class BridgeManager:
         if relevant:
             if (event.kind == "connected" and event.status == 0 and event.role == 1) or (event.kind == "advertising" and event.state == 1 and event.handle is not None):
                 self._incoming_pending = True
+                if legacy:
+                    self._connection_owner = runtime
+                    self._legacy_target = runtime
+                    if event.address:
+                        self._peer_address = event.address
             self._spawn_event(self._async_hci_event(runtime, event))
 
     async def _async_hci_event(self, runtime: RadarRuntime, event: BluetoothEvent) -> None:
         async with self._operation_lock:
-            if (self.pairing or self.connection_target) is not runtime or self._stopping:
+            if self._current_runtime() is not runtime or self._stopping:
                 self._incoming_pending = False
                 return
             try:
@@ -874,19 +923,26 @@ class BridgeManager:
         vendor_incoming = event.kind == "advertising" and event.instance == runtime.instance and event.state == 1 and event.handle is not None
         if incoming or vendor_incoming:
             if self.connection_handle is None:
+                if isinstance(self.advertiser, LegacyAdvertiser):
+                    self._connection_owner = runtime
+                    self._legacy_target = runtime
                 self.connection_handle = event.handle
                 self._notifications.clear()
                 self.server.reset_session()
                 runtime.protocol.connect(time.monotonic())
                 self._connection_advertisement_ready = False
-                await self.advertiser.async_configure(runtime.instance, runtime.mac, False, interval_ms=100)
+                if isinstance(self.advertiser, LegacyAdvertiser):
+                    await self.advertiser.async_disable(runtime.instance)
+                else:
+                    await self.advertiser.async_configure(runtime.instance, runtime.mac, False, interval_ms=100)
                 runtime._enabled = False
                 runtime._next_publication = 0.0
                 self._connection_advertisement_ready = True
             if event.address:
                 self._peer_address = event.address
-        elif event.kind == "disconnected" and event.handle == self.connection_handle:
+        elif event.kind == "disconnected" and event.status == 0 and (event.handle == self.connection_handle or (self.connection_handle is None and self._connection_owner is runtime)):
             self.connection_handle = None
+            self._connection_owner = None
             self._peer_address = self._peer_path = None
             runtime.protocol.disconnect()
             self._notifications.clear()
@@ -904,23 +960,23 @@ class BridgeManager:
         self.wakeup.set()
 
     def _read_gatt(self, channel: int) -> bytes:
-        runtime = self.pairing or self.connection_target
+        runtime = self._current_runtime()
         return runtime.protocol.read(channel) if runtime else b""
 
     def _notify_channels_changed(self, channels: set[int]) -> None:
-        runtime = self.pairing or self.connection_target
+        runtime = self._current_runtime()
         if runtime is not None:
             runtime.protocol.set_notify_channels(channels)
             self.wakeup.set()
 
     def _mtu_changed(self, mtu: int) -> None:
-        runtime = self.pairing or self.connection_target
+        runtime = self._current_runtime()
         if runtime is not None:
             runtime.protocol.set_mtu(mtu)
 
     async def _write_gatt(self, channel: int, value: bytes, peer_path: str | None) -> None:
         async with self._operation_lock:
-            runtime = self.pairing or self.connection_target
+            runtime = self._current_runtime()
             if runtime is None:
                 raise DBusError("org.bluez.Error.NotAuthorized", "Open the selected device's pairing window first")
             if self._peer_path and peer_path != self._peer_path:
@@ -950,6 +1006,9 @@ class BridgeManager:
     async def _async_publish(self, runtime: RadarRuntime, now: float) -> None:
         if runtime._error:
             return
+        legacy = isinstance(self.advertiser, LegacyAdvertiser)
+        if legacy and self._legacy_connection_busy():
+            return
         pairing = self.pairing is runtime
         if (pairing or self.connection_target is runtime) and self.connection_handle is not None and not self._connection_advertisement_ready:
             return
@@ -960,6 +1019,11 @@ class BridgeManager:
             return
         if now < runtime._next_publication:
             return
+        if legacy:
+            if not await self._async_prepare_legacy_counter(runtime) or self._legacy_connection_busy():
+                return
+        queued_event = None
+        queued_property = None
         if not runtime.bound or runtime.model.auth_mode == "standard_nus":
             counter = runtime._hello_sequence
             service_data = runtime.protocol.hello(counter)
@@ -967,8 +1031,10 @@ class BridgeManager:
         else:
             if runtime._event_objects:
                 object_id, object_payload = runtime._event_objects.popleft()
+                queued_event = (object_id, object_payload)
             elif runtime._pending_objects:
                 object_id = runtime._pending_objects.popleft()
+                queued_property = object_id
                 object_payload = runtime._object_payloads[object_id]
             else:
                 objects = list(runtime._objects)
@@ -978,7 +1044,7 @@ class BridgeManager:
                 runtime._rotation += 1
                 object_payload = runtime._object_payloads[object_id]
             try:
-                counter = await runtime.async_counter()
+                counter = runtime.counter.take() if legacy else await runtime.async_counter()
             except (OSError, ValueError, ProtocolError) as error:
                 runtime._error = f"Identity persistence failed: {error}"
                 runtime.notify_listeners()
@@ -990,8 +1056,27 @@ class BridgeManager:
         await self.advertiser.async_set_data(
             runtime.instance, advertising_payload(service_data), scan_response_payload(runtime, counter),
         )
+        def defer_publication() -> None:
+            if queued_event is not None:
+                runtime._event_objects.appendleft(queued_event)
+            elif queued_property is not None and queued_property not in runtime._pending_objects:
+                runtime._pending_objects.appendleft(queued_property)
+
+        if legacy and self._legacy_connection_busy():
+            defer_publication()
+            return
         if not runtime._enabled:
-            await self.advertiser.async_enable(runtime.instance)
+            if legacy:
+                if not await self.server.async_check_legacy_occupancy(busy=self._legacy_connection_busy):
+                    defer_publication()
+                    return
+                if self._legacy_connection_busy():
+                    defer_publication()
+                    return
+            enabled = await self.advertiser.async_enable(runtime.instance)
+            if legacy and (enabled is False or self._legacy_connection_busy()):
+                defer_publication()
+                return
             runtime._enabled = True
         runtime._next_publication = now + (0.4 if runtime._event_objects else 0.5 if runtime._pending_objects else 1.0)
         runtime._last_broadcast = datetime.now(timezone.utc).isoformat()
@@ -1007,8 +1092,10 @@ class BridgeManager:
 
     async def _async_recover(self) -> None:
         async with self._operation_lock:
+            peer_address = self._peer_address
             self.pairing = None
             self.connection_target = None
+            self._connection_owner = None
             self._legacy_target = None
             self._selection_deadline = 0.0
             self._incoming_pending = False
@@ -1018,7 +1105,11 @@ class BridgeManager:
                 await self.advertiser.async_stop()
             except HciError:
                 pass
-            await self.server.async_stop()
+            try:
+                if peer_address:
+                    await self.server.async_disconnect_peer(peer_address)
+            finally:
+                await self.server.async_stop()
             self.advertiser = VendorAdvertiser(self.adapter, event_callback=self._hci_event)
             self.server = BlueZServer(self.adapter, self._write_gatt, self._read_gatt)
             self.server.subscription_callback = self._notify_channels_changed
@@ -1036,6 +1127,8 @@ class BridgeManager:
         while not self._stopping:
             try:
                 now = time.monotonic()
+                if self.failure is None and (error := getattr(self.advertiser, "failure", None)) is not None:
+                    raise error
                 if self.failure:
                     if now >= self._retry_at:
                         await self._async_recover()
@@ -1046,7 +1139,7 @@ class BridgeManager:
                         legacy = isinstance(self.advertiser, LegacyAdvertiser)
                         if not legacy:
                             await self._async_select_connection(now)
-                        runtime = self.pairing or self.connection_target
+                        runtime = self._current_runtime()
                         if runtime and self.connection_handle is not None:
                             runtime.protocol.poll(now)
                             await runtime.async_persist_pending_identity()
@@ -1084,4 +1177,7 @@ class BridgeManager:
             try:
                 await self.advertiser.async_stop()
             finally:
-                await self.server.async_stop()
+                try:
+                    await self.server.async_stop()
+                finally:
+                    self._connection_owner = None

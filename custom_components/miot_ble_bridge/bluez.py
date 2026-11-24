@@ -184,6 +184,10 @@ class BlueZServer:
         self.manager = None
         self._adapter_properties = None
         self._registered = False
+        self._legacy_hass = None
+        self._legacy_entry_ids: list[str] = []
+        self._legacy_acquired = False
+        self._legacy_powered: bool | None = None
 
     async def async_start(self) -> None:
         self.bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
@@ -204,12 +208,175 @@ class BlueZServer:
             self.bus = None
             raise
 
-    async def async_require_idle_advertising(self) -> None:
+    @staticmethod
+    def _local_scanner_sources(hass, adapter: str) -> set[str]:
+        from habluetooth import HaScanner
+        from homeassistant.components.bluetooth import async_current_scanners
+
+        return {
+            scanner.source.upper() for scanner in async_current_scanners(hass)
+            if isinstance(scanner, HaScanner) and scanner.adapter == adapter
+        }
+
+    @staticmethod
+    async def _async_finish_entry_operation(operation: Awaitable[bool]) -> bool:
+        # Let HA finish changing its entry state before cancellation rolls back.
+        task = asyncio.ensure_future(operation)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await asyncio.shield(task)
+            raise
+
+    async def _async_require_unoccupied(
+        self, *, discovery: bool, busy: Callable[[], bool] | None = None,
+    ) -> bool:
+        if busy is not None and busy():
+            return False
         active = await asyncio.wait_for(
             self._adapter_properties.call_get("org.bluez.LEAdvertisingManager1", "ActiveInstances"), 5,
         )
+        if busy is not None and busy():
+            return False
         if active.value:
             raise RuntimeError(f"{self.adapter} already has BlueZ advertisements on the standard advertiser")
+        if discovery:
+            discovering = await asyncio.wait_for(
+                self._adapter_properties.call_get("org.bluez.Adapter1", "Discovering"), 5,
+            )
+            if busy is not None and busy():
+                return False
+            if discovering.value:
+                raise RuntimeError(f"{self.adapter} is being used for discovery by another Bluetooth client")
+        introspection = await self.bus.introspect("org.bluez", "/")
+        if busy is not None and busy():
+            return False
+        objects = self.bus.get_proxy_object("org.bluez", "/", introspection).get_interface(
+            "org.freedesktop.DBus.ObjectManager"
+        )
+        managed = await asyncio.wait_for(objects.call_get_managed_objects(), 5)
+        if busy is not None and busy():
+            return False
+        prefix = f"/org/bluez/{self.adapter}/dev_"
+        for path, interfaces in managed.items():
+            device = interfaces.get("org.bluez.Device1", {})
+            connected = device.get("Connected")
+            if path.startswith(prefix) and connected is not None and connected.value:
+                raise RuntimeError(f"{self.adapter} has an active Bluetooth connection owned by another client")
+        return True
+
+    async def async_require_idle_advertising(self, hass=None) -> None:
+        """Acquire a dedicated legacy advertiser without stopping bluetoothd."""
+        if self._legacy_acquired:
+            return
+        if self._legacy_entry_ids:
+            await self._async_restore_scanners()
+        await self._async_require_unoccupied(discovery=False)
+        powered = await asyncio.wait_for(
+            self._adapter_properties.call_get("org.bluez.Adapter1", "Powered"), 5,
+        )
+        if not powered.value:
+            raise RuntimeError(f"{self.adapter} must be powered before legacy advertising starts")
+        self._legacy_hass = hass
+        self._legacy_powered = bool(powered.value)
+        try:
+            if hass is not None:
+                address = await asyncio.wait_for(
+                    self._adapter_properties.call_get("org.bluez.Adapter1", "Address"), 5,
+                )
+                sources = self._local_scanner_sources(hass, self.adapter)
+                entries = [
+                    entry for entry in hass.config_entries.async_entries("bluetooth")
+                    if str(entry.unique_id).upper() == str(address.value).upper()
+                    and not entry.data.get("source_config_entry_id")
+                ]
+                if len(entries) > 1 or (sources and not entries):
+                    raise RuntimeError(f"Cannot safely pause the HA scanner owner for {self.adapter}")
+                for entry in entries:
+                    state = getattr(entry.state, "value", entry.state)
+                    if state == "loaded":
+                        self._legacy_entry_ids.append(entry.entry_id)
+                        if not await self._async_finish_entry_operation(
+                            hass.config_entries.async_unload(entry.entry_id),
+                        ):
+                            raise RuntimeError(f"Unable to pause the HA scanner for {self.adapter}")
+                    elif state != "not_loaded":
+                        raise RuntimeError(f"The HA scanner for {self.adapter} is still changing state")
+            await self.async_check_legacy_occupancy()
+            self._legacy_acquired = True
+            await self._async_reset_legacy_adapter()
+        except BaseException:
+            self._legacy_acquired = False
+            try:
+                await self._async_restore_scanners()
+            finally:
+                self._legacy_powered = None
+            raise
+
+    async def async_check_legacy_occupancy(
+        self, *, busy: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Reject external users before the caller changes the legacy address."""
+        if busy is not None and busy():
+            return False
+        if self._legacy_hass is not None and self._local_scanner_sources(self._legacy_hass, self.adapter):
+            raise RuntimeError(f"The HA scanner for {self.adapter} restarted during legacy advertising")
+        return await self._async_require_unoccupied(discovery=True, busy=busy)
+
+    @property
+    def local_scanning_paused(self) -> bool:
+        return self._legacy_acquired and bool(self._legacy_entry_ids)
+
+    async def _async_restore_scanners(self) -> None:
+        hass = self._legacy_hass
+        if hass is None:
+            return
+        if getattr(hass, "is_stopping", False):
+            self._legacy_entry_ids.clear()
+        else:
+            for entry_id in tuple(self._legacy_entry_ids):
+                entry = hass.config_entries.async_get_entry(entry_id)
+                if entry is not None and entry.disabled_by is None:
+                    state = getattr(entry.state, "value", entry.state)
+                    if state in ("setup_error", "setup_retry"):
+                        if not await self._async_finish_entry_operation(
+                            hass.config_entries.async_unload(entry_id),
+                        ):
+                            raise RuntimeError(f"Unable to recover the HA scanner for {self.adapter}")
+                        state = "not_loaded"
+                    if state == "not_loaded":
+                        if not await self._async_finish_entry_operation(
+                            hass.config_entries.async_setup(entry_id),
+                        ):
+                            raise RuntimeError(f"Unable to restore the HA scanner for {self.adapter}")
+                    elif state != "loaded":
+                        raise RuntimeError(f"Cannot restore the HA scanner for {self.adapter} from state {state}")
+                self._legacy_entry_ids.remove(entry_id)
+        self._legacy_hass = None
+
+    async def _async_release_legacy(self) -> None:
+        try:
+            if self._legacy_acquired:
+                await self.async_check_legacy_occupancy()
+                await self._async_reset_legacy_adapter()
+        finally:
+            self._legacy_acquired = False
+            try:
+                await self._async_restore_scanners()
+            finally:
+                self._legacy_powered = None
+
+    async def _async_reset_legacy_adapter(self) -> None:
+        # BlueZ retains its GATT database across Powered transitions. Reset only
+        # this dedicated adapter to separate legacy/extended HCI command modes.
+        try:
+            await asyncio.wait_for(self._adapter_properties.call_set(
+                "org.bluez.Adapter1", "Powered", Variant("b", False),
+            ), 5)
+        finally:
+            await asyncio.wait_for(self._adapter_properties.call_set(
+                "org.bluez.Adapter1", "Powered", Variant("b", self._legacy_powered),
+            ), 5)
 
     def notify(self, channel: int, value: bytes) -> bool:
         return self.characteristics[channel].notify(value)
@@ -247,6 +414,7 @@ class BlueZServer:
 
     async def async_stop(self) -> None:
         if self.bus is None:
+            await self._async_restore_scanners()
             return
         try:
             if self._registered and self.manager is not None:
@@ -255,6 +423,9 @@ class BlueZServer:
             _LOGGER.debug("BlueZ GATT application was already removed", exc_info=True)
         finally:
             self._registered = False
-            self.bus.disconnect()
-            self.bus = None
-            self._adapter_properties = None
+            try:
+                await self._async_release_legacy()
+            finally:
+                self.bus.disconnect()
+                self.bus = None
+                self._adapter_properties = None

@@ -1,5 +1,6 @@
 """BlueZ DBus object and bounded notification tests without a real bus."""
 
+import asyncio
 import importlib.util
 from pathlib import Path
 import sys
@@ -183,6 +184,381 @@ class ServerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bus.disconnected, 1)
         self.assertFalse(self.server._registered)
         self.assertIsNone(self.server.bus)
+
+
+class LegacyScannerLeaseTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.server = bluez.BlueZServer("hci0", AsyncMock(), lambda _channel: b"")
+        self.events = []
+        self.powered = True
+        self.active_advertisers = 0
+        self.external_discovery = False
+        self.managed_objects = {}
+        self.local_entry = self.make_entry("local", "AA:BB:CC:DD:EE:00")
+        self.other_entry = self.make_entry("other", "AA:BB:CC:DD:EE:01")
+        self.proxy_entry = self.make_entry("proxy", self.local_entry.unique_id)
+        self.proxy_entry.data["source_config_entry_id"] = "esphome-proxy"
+        self.entries = {
+            entry.entry_id: entry for entry in (self.local_entry, self.other_entry, self.proxy_entry)
+        }
+        self.hass = SimpleNamespace(
+            is_stopping=False,
+            config_entries=SimpleNamespace(
+                async_entries=Mock(side_effect=lambda _domain: list(self.entries.values())),
+                async_get_entry=Mock(side_effect=self.entries.get),
+                async_unload=AsyncMock(side_effect=self.unload_entry),
+                async_setup=AsyncMock(side_effect=self.setup_entry),
+            ),
+        )
+        self.manager = SimpleNamespace(
+            call_register_application=AsyncMock(),
+            call_unregister_application=AsyncMock(),
+            call_get=AsyncMock(side_effect=self.get_property),
+            call_set=AsyncMock(side_effect=self.set_property),
+            call_get_managed_objects=AsyncMock(side_effect=lambda: self.managed_objects),
+        )
+        self.bus = FakeBus(self.manager)
+        with patch.object(bluez, "MessageBus", return_value=self.bus):
+            await self.server.async_start()
+        self.scanners = patch.object(
+            self.server, "_local_scanner_sources", side_effect=self.local_sources,
+        )
+        self.scanners.start()
+        self.addCleanup(self.scanners.stop)
+
+    @staticmethod
+    def make_entry(entry_id, address):
+        return SimpleNamespace(
+            entry_id=entry_id, unique_id=address, state=SimpleNamespace(value="loaded"),
+            data={"address": address}, options={"scanning_mode": "active"}, disabled_by=None,
+        )
+
+    def local_sources(self, _hass, adapter):
+        if adapter == "hci0" and self.local_entry.state.value == "loaded":
+            return {self.local_entry.unique_id}
+        return set()
+
+    async def unload_entry(self, entry_id):
+        self.events.append(("unload", entry_id))
+        self.entries[entry_id].state.value = "not_loaded"
+        return True
+
+    async def setup_entry(self, entry_id):
+        self.events.append(("setup", entry_id))
+        self.entries[entry_id].state.value = "loaded"
+        return True
+
+    async def get_property(self, interface, name):
+        return {
+            "ActiveInstances": Variant("y", self.active_advertisers),
+            "Discovering": Variant("b", self.external_discovery),
+            "Powered": Variant("b", self.powered),
+            "Address": Variant("s", self.local_entry.unique_id.lower()),
+        }[name]
+
+    async def set_property(self, interface, name, value):
+        self.assertEqual((interface, name), ("org.bluez.Adapter1", "Powered"))
+        self.events.append(("power", value.value))
+        self.powered = value.value
+
+    def connected_device(self, adapter="hci0"):
+        return {
+            f"/org/bluez/{adapter}/dev_11_22_33_44_55_66": {
+                "org.bluez.Device1": {"Connected": Variant("b", True)},
+            },
+        }
+
+    async def test_lease_only_pauses_matching_local_entry_and_preserves_configuration(self):
+        original = [(entry.data.copy(), entry.options.copy(), entry.disabled_by) for entry in self.entries.values()]
+        await self.server.async_require_idle_advertising(self.hass)
+        self.assertTrue(self.server.local_scanning_paused)
+        self.assertEqual(self.events, [("unload", "local"), ("power", False), ("power", True)])
+        self.assertTrue(self.server._registered)
+        self.manager.call_unregister_application.assert_not_awaited()
+        self.assertEqual(self.other_entry.state.value, "loaded")
+        self.assertEqual(self.proxy_entry.state.value, "loaded")
+        await self.server.async_stop()
+        self.assertEqual(self.events[-3:], [("power", False), ("power", True), ("setup", "local")])
+        self.hass.config_entries.async_unload.assert_awaited_once_with("local")
+        self.hass.config_entries.async_setup.assert_awaited_once_with("local")
+        self.assertEqual(original, [(entry.data, entry.options, entry.disabled_by) for entry in self.entries.values()])
+        self.assertTrue(self.powered)
+        self.assertFalse(self.server.local_scanning_paused)
+        self.assertEqual(self.bus.disconnected, 1)
+
+    async def test_other_adapter_connection_does_not_block_dedicated_adapter(self):
+        self.managed_objects = self.connected_device("hci1")
+        await self.server.async_require_idle_advertising(self.hass)
+        await self.server.async_stop()
+        self.assertEqual(self.local_entry.state.value, "loaded")
+
+    async def test_advertisement_or_connected_peer_is_rejected_before_pausing_ha(self):
+        for occupancy in ("advertisement", "connection"):
+            with self.subTest(occupancy=occupancy):
+                self.active_advertisers = int(occupancy == "advertisement")
+                self.managed_objects = self.connected_device() if occupancy == "connection" else {}
+                with self.assertRaisesRegex(RuntimeError, "another client|advertisements"):
+                    await self.server.async_require_idle_advertising(self.hass)
+        self.hass.config_entries.async_unload.assert_not_awaited()
+        self.manager.call_set.assert_not_awaited()
+
+    async def test_external_discovery_after_unload_rolls_back_without_reset(self):
+        self.external_discovery = True
+        with self.assertRaisesRegex(RuntimeError, "discovery"):
+            await self.server.async_require_idle_advertising(self.hass)
+        self.assertEqual(self.events, [("unload", "local"), ("setup", "local")])
+        self.assertFalse(self.server._legacy_entry_ids)
+        self.assertIsNone(self.server._legacy_hass)
+
+    async def test_discovery_without_ha_ownership_is_rejected(self):
+        self.external_discovery = True
+        with self.assertRaisesRegex(RuntimeError, "discovery"):
+            await self.server.async_require_idle_advertising()
+        self.manager.call_set.assert_not_awaited()
+
+    async def test_powered_off_adapter_is_not_turned_on_by_acquisition(self):
+        self.powered = False
+        with self.assertRaisesRegex(RuntimeError, "must be powered"):
+            await self.server.async_require_idle_advertising(self.hass)
+        self.hass.config_entries.async_unload.assert_not_awaited()
+        self.manager.call_set.assert_not_awaited()
+
+    async def test_missing_or_ambiguous_scanner_owner_is_rejected(self):
+        for ambiguous in (False, True):
+            with self.subTest(ambiguous=ambiguous):
+                self.entries.pop("duplicate", None)
+                self.entries.pop("local", None)
+                if ambiguous:
+                    self.entries["local"] = self.local_entry
+                    self.entries["duplicate"] = self.make_entry("duplicate", self.local_entry.unique_id)
+                with self.assertRaisesRegex(RuntimeError, "Cannot safely pause"):
+                    await self.server.async_require_idle_advertising(self.hass)
+        self.hass.config_entries.async_unload.assert_not_awaited()
+
+    async def test_previously_unloaded_entry_stays_unloaded(self):
+        self.local_entry.state.value = "not_loaded"
+        await self.server.async_require_idle_advertising(self.hass)
+        await self.server.async_stop()
+        self.hass.config_entries.async_unload.assert_not_awaited()
+        self.hass.config_entries.async_setup.assert_not_awaited()
+        self.assertEqual(self.local_entry.state.value, "not_loaded")
+
+    async def test_unload_failure_with_loaded_entry_preserves_running_scanner(self):
+        self.hass.config_entries.async_unload.side_effect = None
+        self.hass.config_entries.async_unload.return_value = False
+        with self.assertRaisesRegex(RuntimeError, "Unable to pause"):
+            await self.server.async_require_idle_advertising(self.hass)
+        self.hass.config_entries.async_setup.assert_not_awaited()
+        self.assertEqual(self.local_entry.state.value, "loaded")
+        self.assertFalse(self.server._legacy_entry_ids)
+
+    async def test_native_failed_unload_is_reported_and_keeps_recovery_record(self):
+        async def fail_unload(_entry_id):
+            self.local_entry.state.value = "failed_unload"
+            return False
+
+        self.hass.config_entries.async_unload.side_effect = fail_unload
+        with self.assertRaisesRegex(RuntimeError, "failed_unload"):
+            await self.server.async_require_idle_advertising(self.hass)
+        self.assertEqual(self.server._legacy_entry_ids, ["local"])
+        self.assertIs(self.server._legacy_hass, self.hass)
+        with self.assertRaisesRegex(RuntimeError, "failed_unload"):
+            await self.server.async_stop()
+        self.assertIsNone(self.server.bus)
+        self.assertEqual(self.bus.disconnected, 1)
+
+    async def test_cancellation_waits_for_unload_before_restoring_original_entry(self):
+        entered = asyncio.Event()
+        finish = asyncio.Event()
+
+        async def unload(_entry_id):
+            self.local_entry.state.value = "unload_in_progress"
+            entered.set()
+            await finish.wait()
+            return await self.unload_entry("local")
+
+        self.hass.config_entries.async_unload.side_effect = unload
+        acquire = asyncio.create_task(self.server.async_require_idle_advertising(self.hass))
+        await entered.wait()
+        acquire.cancel()
+        await asyncio.sleep(0)
+        self.assertFalse(acquire.done())
+        finish.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await acquire
+        self.assertEqual(self.local_entry.state.value, "loaded")
+        self.hass.config_entries.async_setup.assert_awaited_once_with("local")
+        self.manager.call_set.assert_not_awaited()
+        self.assertFalse(self.server._legacy_entry_ids)
+
+    async def test_failed_power_down_still_restores_power_and_scanner(self):
+        async def fail_power_down(interface, name, value):
+            await self.set_property(interface, name, value)
+            if not value.value:
+                raise DBusError("org.bluez.Error.Failed", "Injected reset failure")
+
+        self.manager.call_set.side_effect = fail_power_down
+        with self.assertRaises(DBusError):
+            await self.server.async_require_idle_advertising(self.hass)
+        self.assertTrue(self.powered)
+        self.assertEqual(self.local_entry.state.value, "loaded")
+        self.assertEqual(self.events, [("unload", "local"), ("power", False), ("power", True), ("setup", "local")])
+
+    async def test_failed_exit_reset_restores_scanner_and_reports_error(self):
+        await self.server.async_require_idle_advertising(self.hass)
+
+        async def fail_power_down(interface, name, value):
+            await self.set_property(interface, name, value)
+            if not value.value:
+                raise DBusError("org.bluez.Error.Failed", "Injected reset failure")
+
+        self.manager.call_set.side_effect = fail_power_down
+        with self.assertRaises(DBusError):
+            await self.server.async_stop()
+        self.assertTrue(self.powered)
+        self.assertEqual(self.local_entry.state.value, "loaded")
+        self.assertIsNone(self.server.bus)
+        self.assertEqual(self.bus.disconnected, 1)
+
+    async def test_external_occupancy_at_stop_restores_scanner_without_resetting_peer(self):
+        await self.server.async_require_idle_advertising(self.hass)
+        self.managed_objects = self.connected_device()
+        self.events.clear()
+        with self.assertRaisesRegex(RuntimeError, "another client"):
+            await self.server.async_stop()
+        self.assertEqual(self.events, [("setup", "local")])
+        self.assertEqual(self.local_entry.state.value, "loaded")
+        self.assertIsNone(self.server.bus)
+        self.assertEqual(self.bus.disconnected, 1)
+
+    async def test_restore_failure_is_retryable_after_bus_cleanup(self):
+        await self.server.async_require_idle_advertising(self.hass)
+
+        async def fail_setup(_entry_id):
+            self.local_entry.state.value = "setup_error"
+            return False
+
+        self.hass.config_entries.async_setup.side_effect = fail_setup
+        with self.assertRaisesRegex(RuntimeError, "Unable to restore"):
+            await self.server.async_stop()
+        self.assertEqual(self.server._legacy_entry_ids, ["local"])
+        self.assertIs(self.server._legacy_hass, self.hass)
+        self.assertIsNone(self.server.bus)
+        self.hass.config_entries.async_setup.side_effect = self.setup_entry
+        await self.server.async_stop()
+        self.assertEqual(self.events[-2:], [("unload", "local"), ("setup", "local")])
+        self.assertEqual(self.local_entry.state.value, "loaded")
+        self.assertFalse(self.server._legacy_entry_ids)
+        self.assertIsNone(self.server._legacy_hass)
+        self.assertEqual(self.bus.disconnected, 1)
+
+    async def test_cancelled_restore_finishes_setup_and_can_clear_record_on_retry(self):
+        await self.server.async_require_idle_advertising(self.hass)
+        entered = asyncio.Event()
+        finish = asyncio.Event()
+
+        async def setup(_entry_id):
+            self.local_entry.state.value = "setup_in_progress"
+            entered.set()
+            await finish.wait()
+            return await self.setup_entry("local")
+
+        self.hass.config_entries.async_setup.side_effect = setup
+        stop = asyncio.create_task(self.server.async_stop())
+        await entered.wait()
+        stop.cancel()
+        await asyncio.sleep(0)
+        self.assertFalse(stop.done())
+        finish.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await stop
+        self.assertEqual(self.local_entry.state.value, "loaded")
+        self.assertEqual(self.server._legacy_entry_ids, ["local"])
+        self.assertIsNone(self.server.bus)
+        await self.server.async_stop()
+        self.assertFalse(self.server._legacy_entry_ids)
+        self.hass.config_entries.async_setup.assert_awaited_once_with("local")
+
+    async def test_user_disabling_or_removing_entry_is_respected_at_stop(self):
+        for remove in (False, True):
+            with self.subTest(remove=remove):
+                await self.server.async_require_idle_advertising(self.hass)
+                if remove:
+                    self.entries.pop("local")
+                else:
+                    self.local_entry.disabled_by = "user"
+                await self.server._async_release_legacy()
+                self.assertFalse(self.server._legacy_entry_ids)
+                self.hass.config_entries.async_setup.assert_not_awaited()
+                if remove:
+                    self.assertNotIn("local", self.entries)
+                else:
+                    self.assertEqual(self.local_entry.disabled_by, "user")
+                self.local_entry.disabled_by = None
+                self.local_entry.state.value = "loaded"
+
+    async def test_shutdown_leaves_configuration_enabled_for_next_ha_start(self):
+        await self.server.async_require_idle_advertising(self.hass)
+        self.hass.is_stopping = True
+        await self.server.async_stop()
+        self.hass.config_entries.async_setup.assert_not_awaited()
+        self.assertIsNone(self.local_entry.disabled_by)
+        self.assertFalse(self.server._legacy_entry_ids)
+
+    async def test_ha_scanner_restart_during_lease_is_rejected(self):
+        await self.server.async_require_idle_advertising(self.hass)
+        self.local_entry.state.value = "loaded"
+        with self.assertRaisesRegex(RuntimeError, "restarted"):
+            await self.server.async_check_legacy_occupancy()
+
+    async def test_incoming_during_each_dbus_query_freezes_without_misclassifying_own_peer(self):
+        await self.server.async_require_idle_advertising(self.hass)
+        for stage in ("ActiveInstances", "Discovering", "introspect", "objects"):
+            with self.subTest(stage=stage):
+                pending = False
+
+                async def get_property(interface, name):
+                    nonlocal pending
+                    if name == stage:
+                        pending = True
+                        return Variant("y", 1) if name == "ActiveInstances" else Variant("b", True)
+                    return await self.get_property(interface, name)
+
+                async def introspect(_service, _path):
+                    nonlocal pending
+                    if stage == "introspect":
+                        pending = True
+                    return object()
+
+                async def objects():
+                    nonlocal pending
+                    pending = True
+                    return self.connected_device()
+
+                with patch.object(self.manager, "call_get", AsyncMock(side_effect=get_property)), patch.object(
+                    self.bus, "introspect", AsyncMock(side_effect=introspect),
+                ), patch.object(self.manager, "call_get_managed_objects", AsyncMock(side_effect=objects)):
+                    self.assertFalse(await self.server.async_check_legacy_occupancy(busy=lambda: pending))
+        self.assertTrue(self.server._legacy_acquired)
+        self.hass.config_entries.async_setup.assert_not_awaited()
+        self.assertEqual(self.manager.call_set.await_count, 2)
+
+    async def test_public_scanner_query_filters_proxy_and_other_local_adapter(self):
+        class LocalScanner:
+            def __init__(self, adapter, source):
+                self.adapter, self.source = adapter, source
+
+        current = Mock(return_value=(
+            LocalScanner("hci0", "aa:bb:cc:dd:ee:00"),
+            LocalScanner("hci1", "aa:bb:cc:dd:ee:01"),
+            SimpleNamespace(adapter="hci0", source="remote-proxy"),
+        ))
+        with patch.dict(sys.modules, {
+            "habluetooth": SimpleNamespace(HaScanner=LocalScanner),
+            "homeassistant.components.bluetooth": SimpleNamespace(async_current_scanners=current),
+        }):
+            self.assertEqual(bluez.BlueZServer._local_scanner_sources(self.hass, "hci0"), {"AA:BB:CC:DD:EE:00"})
+        current.assert_called_once_with(self.hass)
 
 
 if __name__ == "__main__":

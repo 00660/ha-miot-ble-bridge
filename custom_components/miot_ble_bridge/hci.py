@@ -13,6 +13,7 @@ import logging
 import re
 import socket
 import struct
+import time
 
 _LOGGER = logging.getLogger(__name__)
 HCI_VENDOR_CAPABILITIES = 0xFD53
@@ -229,6 +230,10 @@ class VendorAdvertiser:
     def usable_instances(self) -> tuple[int, ...]:
         return self.capabilities.usable_instances if self.capabilities else ()
 
+    @property
+    def failure(self) -> HciError | None:
+        return self._failure
+
     def _open_socket(self) -> socket.socket:
         if not hasattr(socket, "AF_BLUETOOTH") or not hasattr(socket, "BTPROTO_HCI"):
             raise HciUnsupportedError("Raw HCI advertising requires Linux Bluetooth sockets")
@@ -352,6 +357,7 @@ class VendorAdvertiser:
                             continue
                         if not event.status and not event.data:
                             continue
+                    self._command_completed(command, event)
                     self._reply.set_result(event)
                 elif isinstance(event, BluetoothEvent):
                     self._dispatch_event(event)
@@ -359,6 +365,9 @@ class VendorAdvertiser:
             raise
         except OSError as err:
             self._fail(HciError(f"HCI event transport failed: {err}"))
+
+    def _command_completed(self, command: _Command, event: CommandEvent) -> None:
+        pass
 
     def _dispatch_event(self, event: BluetoothEvent) -> None:
         instance = event.instance
@@ -485,6 +494,11 @@ class VendorAdvertiser:
 class LegacyAdvertiser(VendorAdvertiser):
     """Reuse the standard advertiser for one static random identity at a time."""
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._recent_connectable: tuple[int, float] | None = None
+        self._enabling_instance: int | None = None
+
     @property
     def usable_instances(self) -> tuple[int, ...]:
         # Software identifiers. Only one is programmed on the controller.
@@ -520,30 +534,53 @@ class LegacyAdvertiser(VendorAdvertiser):
         config.data = data
         config.scan_response = scan
 
-    async def async_enable(self, instance: int) -> None:
+    async def async_enable(self, instance: int) -> bool:
         config = self._instances[instance]
         async with self._enable_lock:
+            if self._handle_instances:
+                return False
             if self._enabled:
                 raise HciError("The standard advertiser already has an active identity")
             if not config.data or config.scan_response is None:
                 raise HciError("Set advertising data before enabling the standard advertiser")
             await self._command(_LE_SET_RANDOM_ADDRESS, _address_bytes(config.mac))
+            if self._handle_instances:
+                return False
             params = struct.pack(
                 "<HHBB7xBB", config.interval, config.interval,
                 0x00 if config.connectable else 0x02, 0x01, 0x07, 0x00,
             )
             await self._command(_LE_SET_ADVERTISING_PARAMETERS, params)
+            if self._handle_instances:
+                return False
             await self._command(_LE_SET_ADVERTISING_DATA, config.data)
+            if self._handle_instances:
+                return False
             await self._command(_LE_SET_SCAN_RESPONSE_DATA, config.scan_response)
-            self._enabled.add(instance)
+            if self._handle_instances:
+                return False
+            self._enabling_instance = instance
             try:
                 await self._command(_LE_SET_ADVERTISING_ENABLE, b"\x01")
-            except HciCommandError:
+            except HciCommandError as error:
                 self._enabled.discard(instance)
+                if error.status == 0x0C and self._handle_instances:
+                    return False
                 raise
+            finally:
+                self._enabling_instance = None
+            if self._handle_instances:
+                if instance not in self._handle_instances.values():
+                    await self._async_disable_radio()
+                return False
+            self._enabled.add(instance)
+            self._recent_connectable = None
+            return True
 
     async def async_disable(self, instance: int) -> None:
         if instance in self._enabled:
+            if self._instances[instance].connectable:
+                self._recent_connectable = (instance, time.monotonic() + self._command_timeout)
             await self._async_disable_radio()
             self._enabled.discard(instance)
 
@@ -557,10 +594,46 @@ class LegacyAdvertiser(VendorAdvertiser):
             if error.status != 0x0C:
                 raise
 
+    def _command_completed(self, command: _Command, event: CommandEvent) -> None:
+        if (event.complete and event.status == 0 and command.opcode == _LE_SET_ADVERTISING_ENABLE
+                and command.payload == b"\x01" and self._enabling_instance is not None
+                and not self._handle_instances):
+            # Commit before the reader consumes a following Connection Complete.
+            self._enabled.add(self._enabling_instance)
+            self._recent_connectable = None
+
     def _dispatch_event(self, event: BluetoothEvent) -> None:
         if event.kind == "connected":
-            if event.role != 1 or not any(self._instances[slot].connectable for slot in self._enabled):
+            if event.role != 1 or event.status != 0 or event.handle is None or not 0 <= event.handle <= 0x0EFF:
                 return
-        elif event.kind != "disconnected" or event.handle not in self._handle_instances:
+            instance = self._handle_instances.get(event.handle)
+            if instance is None:
+                if self._handle_instances:
+                    return
+                candidates = [slot for slot in self._enabled if self._instances[slot].connectable]
+                if len(candidates) == 1:
+                    instance = candidates[0]
+                elif not candidates and self._recent_connectable is not None:
+                    previous, deadline = self._recent_connectable
+                    if time.monotonic() <= deadline:
+                        instance = previous
+                if instance is None:
+                    return
+            if event.instance is not None and event.instance != instance:
+                return
+            self._handle_instances[event.handle] = instance
+            self._recent_connectable = None
+            event = BluetoothEvent(
+                event.kind, instance, event.handle, event.address, event.address_type,
+                event.role, event.status, event.state, event.reason,
+            )
+        elif event.kind != "disconnected" or event.status != 0 or event.handle not in self._handle_instances:
             return
         super()._dispatch_event(event)
+
+    async def async_stop(self) -> None:
+        try:
+            await super().async_stop()
+        finally:
+            self._recent_connectable = None
+            self._enabling_instance = None
