@@ -13,17 +13,22 @@ _LOGGER = logging.getLogger(__name__)
 _GATT_SERVICE = "org.bluez.GattService1"
 _GATT_CHARACTERISTIC = "org.bluez.GattCharacteristic1"
 _CHANNELS = (0x0010, 0x0019, 0x001A, 0x001B)
+_AUX_CHANNELS = (0x0001, 0x0002, 0x0004, 0x0013, 0x0014, 0x0016, 0x0017, 0x0018)
+NUS_RX = 0x6E400002
+NUS_TX = 0x6E400003
+_NUS_UUID = "6e40000{}-b5a3-f393-e0a9-e50e24dcca9e"
 _BASE_UUID = "0000{:04x}-0000-1000-8000-00805f9b34fb"
 
 
 class _Service(ServiceInterface):
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, uuid: str | None = None) -> None:
         super().__init__(_GATT_SERVICE)
         self.path = path
+        self.uuid = uuid or _BASE_UUID.format(0xFE95)
 
     @dbus_property(access=PropertyAccess.READ)
     def UUID(self) -> "s":
-        return _BASE_UUID.format(0xFE95)
+        return self.uuid
 
     @dbus_property(access=PropertyAccess.READ)
     def Primary(self) -> "b":
@@ -42,25 +47,29 @@ class _Service(ServiceInterface):
 
 
 class _Characteristic(ServiceInterface):
-    def __init__(self, server: "BlueZServer", channel: int) -> None:
+    def __init__(self, server: "BlueZServer", channel: int, *, service: _Service | None = None, uuid: str | None = None) -> None:
         super().__init__(_GATT_CHARACTERISTIC)
         self.server = server
         self.channel = channel
-        self.path = f"{server.service.path}/char{channel:04x}"
+        self.service = service or server.service
+        self.uuid = uuid or _BASE_UUID.format(channel)
+        self.path = f"{self.service.path}/char{channel:04x}"
         self._value = b""
         self._notifying = False
         self._pending: deque[bytes] = deque()
 
     @dbus_property(access=PropertyAccess.READ)
     def UUID(self) -> "s":
-        return _BASE_UUID.format(self.channel)
+        return self.uuid
 
     @dbus_property(access=PropertyAccess.READ)
     def Service(self) -> "o":
-        return self.server.service.path
+        return self.service.path
 
     @dbus_property(access=PropertyAccess.READ)
     def Flags(self) -> "as":
+        if self.channel in (0x0002, 0x0004, 0x0014):
+            return ["read"]
         return ["read", "write", "write-without-response", "notify"]
 
     @dbus_property(access=PropertyAccess.READ)
@@ -73,6 +82,7 @@ class _Characteristic(ServiceInterface):
 
     @method()
     def ReadValue(self, options: "a{sv}") -> "ay":
+        self.server.update_mtu(options)
         offset = int(options.get("offset", Variant("q", 0)).value)
         value = self.server.read_callback(self.channel)
         if offset > len(value):
@@ -81,6 +91,7 @@ class _Characteristic(ServiceInterface):
 
     @method()
     async def WriteValue(self, value: "ay", options: "a{sv}"):
+        self.server.update_mtu(options)
         if options.get("offset", Variant("q", 0)).value:
             raise DBusError("org.bluez.Error.InvalidOffset", "Fragmented writes are unsupported")
         if len(value) > 244:
@@ -94,6 +105,7 @@ class _Characteristic(ServiceInterface):
     def StartNotify(self):
         self._notifying = True
         self.emit_properties_changed({"Notifying": True})
+        self.server.subscription_changed()
         while self._pending:
             self._send(self._pending.popleft())
 
@@ -120,6 +132,7 @@ class _Characteristic(ServiceInterface):
         if self._notifying:
             self._notifying = False
             self.emit_properties_changed({"Notifying": False, "Value": b""})
+            self.server.subscription_changed()
 
     def properties(self) -> dict[str, Variant]:
         return {
@@ -138,7 +151,7 @@ class _Application(ServiceInterface):
 
     @method()
     def GetManagedObjects(self) -> "a{oa{sa{sv}}}":
-        objects = {self.server.service.path: {_GATT_SERVICE: self.server.service.properties()}}
+        objects = {service.path: {_GATT_SERVICE: service.properties()} for service in self.server.services}
         objects.update({
             char.path: {_GATT_CHARACTERISTIC: char.properties()}
             for char in self.server.characteristics.values()
@@ -158,7 +171,14 @@ class BlueZServer:
         self.write_callback = write_callback
         self.read_callback = read_callback
         self.service = _Service(f"{self.path}/service0")
-        self.characteristics = {ch: _Characteristic(self, ch) for ch in _CHANNELS}
+        self.nus_service = _Service(f"{self.path}/service1", _NUS_UUID.format(1))
+        self.services = (self.service, self.nus_service)
+        self.characteristics = {ch: _Characteristic(self, ch) for ch in (*_CHANNELS, *_AUX_CHANNELS)}
+        self.characteristics[NUS_RX] = _Characteristic(self, NUS_RX, service=self.nus_service, uuid=_NUS_UUID.format(2))
+        self.characteristics[NUS_TX] = _Characteristic(self, NUS_TX, service=self.nus_service, uuid=_NUS_UUID.format(3))
+        self.subscription_callback: Callable[[set[int]], None] | None = None
+        self.mtu_callback: Callable[[int], None] | None = None
+        self.att_mtu: int | None = None
         self.application = _Application(self)
         self.bus: MessageBus | None = None
         self.manager = None
@@ -171,7 +191,8 @@ class BlueZServer:
             proxy = self.bus.get_proxy_object("org.bluez", f"/org/bluez/{self.adapter}", introspection)
             self.manager = proxy.get_interface("org.bluez.GattManager1")
             self.bus.export(self.path, self.application)
-            self.bus.export(self.service.path, self.service)
+            for service in self.services:
+                self.bus.export(service.path, service)
             for char in self.characteristics.values():
                 self.bus.export(char.path, char)
             await asyncio.wait_for(self.manager.call_register_application(self.path, {}), 10)
@@ -184,7 +205,22 @@ class BlueZServer:
     def notify(self, channel: int, value: bytes) -> bool:
         return self.characteristics[channel].notify(value)
 
+    @property
+    def notifying_channels(self) -> set[int]:
+        return {channel for channel, char in self.characteristics.items() if char._notifying}
+
+    def subscription_changed(self) -> None:
+        if self.subscription_callback is not None:
+            self.subscription_callback(self.notifying_channels)
+
+    def update_mtu(self, options: dict[str, Variant]) -> None:
+        if "mtu" in options:
+            self.att_mtu = int(options["mtu"].value)
+            if self.mtu_callback is not None:
+                self.mtu_callback(self.att_mtu)
+
     def reset_session(self) -> None:
+        self.att_mtu = None
         for char in self.characteristics.values():
             char.clear()
 

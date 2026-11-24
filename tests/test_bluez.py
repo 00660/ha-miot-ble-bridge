@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from dbus_fast import DBusError, Variant
 
@@ -27,9 +27,9 @@ class ObjectTests(unittest.IsolatedAsyncioTestCase):
         self.writer = AsyncMock()
         self.server = bluez.BlueZServer("hci0", self.writer, lambda _channel: b"sample")
 
-    async def test_object_manager_exports_service_and_all_four_characteristics(self):
+    async def test_object_manager_exports_auth_auxiliary_and_nus_characteristics(self):
         objects = method_body(self.server.application, "GetManagedObjects")
-        self.assertEqual(len(objects), 5)
+        self.assertEqual(len(objects), 16)
         service = objects[self.server.service.path]["org.bluez.GattService1"]
         self.assertEqual(service["UUID"].value, "0000fe95-0000-1000-8000-00805f9b34fb")
         self.assertTrue(service["Primary"].value)
@@ -38,6 +38,38 @@ class ObjectTests(unittest.IsolatedAsyncioTestCase):
             properties = objects[char.path]["org.bluez.GattCharacteristic1"]
             self.assertEqual(properties["Service"].value, self.server.service.path)
             self.assertIn("notify", properties["Flags"].value)
+        for channel in (0x0002, 0x0004, 0x0014):
+            self.assertEqual(self.server.characteristics[channel].Flags, ["read"])
+        nus = objects[self.server.nus_service.path]["org.bluez.GattService1"]
+        self.assertEqual(nus["UUID"].value, "6e400001-b5a3-f393-e0a9-e50e24dcca9e")
+        self.assertEqual(self.server.characteristics[bluez.NUS_RX].UUID, "6e400002-b5a3-f393-e0a9-e50e24dcca9e")
+        self.assertEqual(self.server.characteristics[bluez.NUS_TX].Service, self.server.nus_service.path)
+
+    async def test_subscription_changes_report_exact_active_channels(self):
+        self.server.subscription_callback = Mock()
+        auth = self.server.characteristics[0x0019]
+        spec = self.server.characteristics[0x001A]
+        with patch.object(auth, "emit_properties_changed"), patch.object(spec, "emit_properties_changed"):
+            method_body(auth, "StartNotify")
+            method_body(spec, "StartNotify")
+            method_body(auth, "StopNotify")
+        self.assertEqual([call.args[0] for call in self.server.subscription_callback.call_args_list], [{0x0019}, {0x0019, 0x001A}, {0x001A}])
+        self.assertEqual(self.server.notifying_channels, {0x001A})
+
+    async def test_nus_input_uses_its_own_channel_and_peer(self):
+        char = self.server.characteristics[bluez.NUS_RX]
+        await method_body(char, "WriteValue", b"get_prop power bright", {"device": Variant("o", "/test/peer")})
+        self.writer.assert_awaited_once_with(bluez.NUS_RX, b"get_prop power bright", "/test/peer")
+
+    async def test_negotiated_mtu_is_forwarded_before_the_write(self):
+        observed = []
+        self.server.mtu_callback = observed.append
+        char = self.server.characteristics[bluez.NUS_RX]
+        await method_body(char, "WriteValue", b"get_prop power", {"mtu": Variant("q", 247)})
+        self.assertEqual(observed, [247])
+        self.assertEqual(self.server.att_mtu, 247)
+        self.server.reset_session()
+        self.assertIsNone(self.server.att_mtu)
 
     async def test_read_offset_and_invalid_offset(self):
         char = self.server.characteristics[0x0019]
@@ -126,7 +158,7 @@ class ServerLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_exports_only_own_application_and_stop_is_idempotent(self):
         with patch.object(bluez, "MessageBus", return_value=self.bus):
             await self.server.async_start()
-        self.assertEqual(len(self.bus.exports), 6)
+        self.assertEqual(len(self.bus.exports), 17)
         self.assertTrue(all(path.startswith("/org/miot_ble_bridge/hci0") for path in self.bus.exports))
         self.manager.call_register_application.assert_awaited_once_with(self.server.path, {})
         await self.server.async_stop()

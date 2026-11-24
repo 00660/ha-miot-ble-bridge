@@ -8,7 +8,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, MANUFACTURER, MODEL, PRODUCT_ID
+from .const import DOMAIN, MANUFACTURER
 
 
 async def async_setup_entry(
@@ -34,7 +34,7 @@ class MiotForwardingStatusSensor(SensorEntity):
             identifiers={(DOMAIN, entry.entry_id)},
             name=self._runtime.name,
             manufacturer=MANUFACTURER,
-            model=MODEL,
+            model=self._runtime.model.model,
         )
 
     @property
@@ -49,8 +49,9 @@ class MiotForwardingStatusSensor(SensorEntity):
             "illuminance_entity": self._runtime.illuminance_entity,
             "bound": self._runtime.bound,
             "paired_at": self._runtime.paired_at,
-            "model": MODEL,
-            "product_id": f"0x{PRODUCT_ID:04X}",
+            "model": self._runtime.model.model,
+            "product_id": f"0x{self._runtime.model.pid:04X}",
+            "property_entities": {key: value.get("entity_id") for key, value in self._runtime.property_mappings.items() if value.get("source") == "entity"},
             "diagnostics": self._runtime.diagnostics,
         }
 

@@ -1,4 +1,4 @@
-"""Home Assistant radar entities bridged to Xiaomi BLE occupancy sensors."""
+"""Home Assistant entities bridged to independently configured Xiaomi BLE models."""
 
 from __future__ import annotations
 

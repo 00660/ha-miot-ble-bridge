@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from dbus_fast import DBusError
 from homeassistant.core import HassJob, HassJobType
+from test_protocol import deliver_parcel, encrypt_phone_spec, establish_login
 
 
 COMPONENT = Path(__file__).parents[1] / "custom_components" / "miot_ble_bridge"
@@ -75,6 +76,7 @@ class FakeHass:
         self.loop = asyncio.get_running_loop()
         self.config = SimpleNamespace(path=lambda *parts: str(root.joinpath(*parts)))
         self.fail_writes = False
+        self.services = SimpleNamespace(async_call=AsyncMock())
         self.tasks = set()
         self.config_entries = SimpleNamespace(
             async_forward_entry_setups=AsyncMock(),
@@ -203,6 +205,32 @@ class BridgeTestCase(unittest.IsolatedAsyncioTestCase):
         return bridge.RadarRuntime(
             self.hass, FakeEntry(entry_id, lux=lux), self.manager, document
         )
+
+    def model_runtime(self, model_id, *, entry_id="model-entry", mappings=None, mac=MAC):
+        model = bridge.get_model(model_id)
+        entry = FakeEntry(entry_id)
+        entry.data = {"name": "Model", "adapter": "hci0", "model": model_id, "property_mappings": mappings if mappings is not None else bridge.default_mappings(model, {})}
+        document = {"version": 1, "mac": mac, "identity": {**IDENTITY, "mac": mac, "pid": model.pid}, "counter_reserved_until": 0, "paired_at": None}
+        runtime = bridge.RadarRuntime(self.hass, entry, self.manager, document)
+        runtime.sync_sources()
+        return runtime
+
+    def authenticated_request(self, runtime, items):
+        captured = []
+        original = runtime.protocol.on_set
+        runtime.protocol.on_set = captured.append
+        try:
+            session = establish_login(runtime.protocol)
+            body = bytes([len(items)])
+            for key, value in items:
+                prop = runtime.model.property_by_key[key]
+                raw = prop.encode(value)
+                body += bytes([prop.siid]) + prop.piid.to_bytes(2, "little") + ((prop.type_code << 12) | len(raw)).to_bytes(2, "little") + raw
+            plain = runtime.protocol._spec_plain(0, 7, body)
+            deliver_parcel(runtime.protocol, 0, encrypt_phone_spec(session, plain), channel=0x001A, now=0.2)
+            return captured[0]
+        finally:
+            runtime.protocol.on_set = original
 
 
 class SourceStateTests(BridgeTestCase):
@@ -387,6 +415,225 @@ class PersistenceTests(BridgeTestCase):
         self.assertIsNotNone(runtime._error)
         self.assertIsNone(self.manager.failure)
         self.assertEqual(runtime.counter.next_counter, 0)
+
+
+class ModelMappingTests(BridgeTestCase):
+    async def test_thermometer_getter_aliases_follow_live_values_and_omit_offline_sources(self):
+        runtime = self.model_runtime("miaomiaoce.sensor_ht.t2")
+        runtime.property_mappings["2.1"] = {"source": "entity", "entity_id": "sensor.temperature"}
+        runtime.property_mappings["2.2"] = {"source": "entity", "entity_id": "sensor.humidity"}
+        self.hass.states.set("sensor.temperature", "23.5", unit_of_measurement="°C")
+        self.hass.states.set("sensor.humidity", "55.6", unit_of_measurement="%")
+        runtime.sync_sources()
+        self.assertEqual(runtime._property_values["2.1001"], 23.5)
+        self.assertEqual(runtime._property_values["3.1001"], 23.5)
+        self.assertEqual(runtime._property_values["2.1008"], 55.6)
+        self.assertEqual(runtime._property_values["3.1002"], 56)
+        self.hass.states.set("sensor.temperature", "unavailable")
+        runtime.sync_sources()
+        self.assertNotIn("2.1001", runtime._property_values)
+        self.assertNotIn("3.1001", runtime._property_values)
+        self.assertEqual(runtime._property_values["3.1002"], 56)
+
+    async def test_occupancy_fast_scan_does_not_accumulate_presence_duration(self):
+        runtime = self.model_runtime(bridge.DEFAULT_MODEL)
+        runtime.property_mappings["2.1078"] = {"source": "virtual", "value": 2}
+        runtime.sync_sources()
+        runtime.update_duration(100000)
+        self.assertTrue(runtime._source_available)
+        self.assertIsNone(runtime._since)
+        self.assertEqual(runtime._objects[0x484E], 2)
+        self.assertNotIn(0x4851, runtime._objects)
+        self.assertNotIn(0x4852, runtime._objects)
+
+    async def test_model_change_cannot_reuse_another_models_identity(self):
+        entry = FakeEntry()
+        entry.data["model"] = "xiaomi.cooler.r02p"
+        document = {"version": 1, "mac": MAC, "identity": dict(IDENTITY), "counter_reserved_until": 0, "paired_at": None}
+        with self.assertRaises(ValueError):
+            bridge.RadarRuntime(self.hass, entry, self.manager, document)
+
+    async def test_virtual_write_is_saved_only_for_its_own_entry(self):
+        runtime = self.model_runtime("careco.nlight.o654", entry_id="light-one")
+        other = self.model_runtime("careco.nlight.o654", entry_id="light-two")
+        request = self.authenticated_request(runtime, [("7.2", 75)])
+        self.assertEqual(await runtime._async_write_properties(request), {"7.2": 0})
+        runtime.sync_sources()
+        other.sync_sources()
+        self.assertEqual(runtime._property_values["7.2"], 75)
+        self.assertEqual(other._property_values["7.2"], 50)
+        saved = json.loads(Path(runtime._path).read_text(encoding="utf-8"))
+        restarted = bridge.RadarRuntime(self.hass, runtime.entry, self.manager, saved)
+        restarted.sync_sources()
+        self.assertEqual(restarted._property_values["7.2"], 75)
+        self.assertEqual(restarted.mac, runtime.mac)
+        self.assertEqual(restarted.protocol.identity, runtime.protocol.identity)
+
+    async def test_failed_virtual_write_leaves_original_value_and_identity(self):
+        runtime = self.model_runtime("careco.nlight.o654")
+        identity = runtime.protocol.identity
+        request = self.authenticated_request(runtime, [("7.2", 75)])
+        self.hass.fail_writes = True
+        self.assertEqual(await runtime._async_write_properties(request), {"7.2": 1})
+        runtime.sync_sources()
+        self.assertEqual(runtime._property_values["7.2"], 50)
+        self.assertEqual(runtime.protocol.identity, identity)
+
+    async def test_new_virtual_configuration_supersedes_a_saved_app_setting(self):
+        runtime = self.model_runtime("careco.nlight.o654")
+        request = self.authenticated_request(runtime, [("7.2", 75)])
+        await runtime._async_write_properties(request)
+        runtime.entry.options = {"property_mappings": {**runtime.property_mappings, "7.2": {"source": "virtual", "value": 60}}}
+        reloaded = bridge.RadarRuntime(self.hass, runtime.entry, self.manager, runtime._document)
+        reloaded.sync_sources()
+        self.assertEqual(reloaded._property_values["7.2"], 60)
+
+    async def test_late_request_does_not_call_ha_after_disconnect(self):
+        runtime = self.model_runtime("careco.nlight.o654")
+        runtime.property_mappings["7.1"] = {"source": "entity", "entity_id": "switch.test"}
+        request = self.authenticated_request(runtime, [("7.1", True)])
+        runtime.protocol.disconnect()
+        self.assertEqual(await runtime._async_write_properties(request), {})
+        self.hass.services.async_call.assert_not_awaited()
+
+    async def test_expired_same_session_request_does_not_execute_queued_ha_control(self):
+        runtime = self.model_runtime("careco.nlight.o654")
+        runtime.property_mappings["7.1"] = {"source": "entity", "entity_id": "switch.test"}
+        request = self.authenticated_request(runtime, [("7.1", True)])
+        runtime.protocol.poll(21)
+        self.assertTrue(runtime.protocol.logged_in)
+        await runtime._async_handle_request(request)
+        self.hass.services.async_call.assert_not_awaited()
+        self.assertNotIn("virtual_values", runtime._document)
+
+    async def test_entity_write_uses_the_mapped_service_and_reports_failures(self):
+        runtime = self.model_runtime("careco.nlight.o654")
+        runtime.property_mappings["7.1"] = {"source": "entity", "entity_id": "switch.test"}
+        self.hass.states.set("switch.test", "off")
+        request = self.authenticated_request(runtime, [("7.1", True)])
+        self.assertEqual(await runtime._async_write_properties(request), {"7.1": 0})
+        self.hass.services.async_call.assert_awaited_once_with("switch", "turn_on", {"entity_id": "switch.test"}, blocking=True)
+        self.hass.services.async_call.side_effect = RuntimeError("Unavailable mapped service")
+        request = self.authenticated_request(runtime, [("7.1", False)])
+        self.assertEqual(await runtime._async_write_properties(request), {"7.1": 1})
+
+    async def test_unavailable_temperature_is_omitted_without_replacing_other_attributes(self):
+        runtime = self.model_runtime("xiaomi.cooler.r02p")
+        runtime.property_mappings["3.3"] = {"source": "entity", "entity_id": "sensor.temperature"}
+        self.hass.states.set("sensor.temperature", "unavailable")
+        runtime.sync_sources()
+        self.assertNotIn("3.3", runtime._property_values)
+        self.assertNotIn(0x4C03, runtime._objects)
+        self.assertIn("4.1", runtime._property_values)
+
+    async def test_virtual_light_scene_updates_its_own_brightness_and_temperature(self):
+        runtime = self.model_runtime("careco.nlight.o654")
+        request = self.authenticated_request(runtime, [("7.4", 3)])
+        self.assertEqual(await runtime._async_write_properties(request), {"7.4": 0})
+        runtime.sync_sources()
+        self.assertEqual((runtime._property_values["7.2"], runtime._property_values["7.3"]), (100, 2700))
+
+    async def test_kettle_virtual_gear_updates_virtual_water_temperature(self):
+        runtime = self.model_runtime("yunmi.kettle.v13")
+        request = self.authenticated_request(runtime, [("3.3", 4)])
+        self.assertEqual(await runtime._async_write_properties(request), {"3.3": 0})
+        runtime.sync_sources()
+        self.assertEqual(runtime._property_values["3.6"], 90)
+        self.assertFalse(runtime.model.property_by_key["3.6"].writable)
+
+    async def test_kettle_gear_does_not_replace_real_ha_water_temperature(self):
+        runtime = self.model_runtime("yunmi.kettle.v13")
+        runtime.property_mappings["3.6"] = {"source": "entity", "entity_id": "sensor.water"}
+        self.hass.states.set("sensor.water", "42", unit_of_measurement="°C")
+        runtime.sync_sources()
+        request = self.authenticated_request(runtime, [("3.3", 4)])
+        await runtime._async_write_properties(request)
+        runtime.sync_sources()
+        self.assertEqual(runtime._property_values["3.6"], 42)
+
+    async def test_motion_event_keeps_dark_light_state(self):
+        runtime = self.model_runtime("lumi.motion.bmgl01")
+        runtime.property_mappings["2.1"] = {"source": "virtual", "value": 1}
+        runtime.event_mappings["2.e.1"] = {"source": "entity", "entity_id": "event.motion", "trigger_value": ""}
+        runtime.sync_sources()
+        runtime._process_event_sources(SimpleNamespace(data={"entity_id": "event.motion", "old_state": SimpleNamespace(state="first"), "new_state": SimpleNamespace(state="second")}))
+        self.assertEqual(runtime._event_objects[0], (0x000F, b"\x01\x00\x00"))
+
+    async def test_event_csv_source_is_live_and_unknown_does_not_fall_back(self):
+        runtime = self.model_runtime("yunmai.scales.ms103")
+        runtime.event_mappings["8.e.2"] = {"source": "entity", "entity_id": "event.measurement", "trigger_value": "", "arguments": {"8.1": {"source": "entity", "entity_id": "sensor.result_csv"}}}
+        event = SimpleNamespace(data={"entity_id": "event.measurement", "old_state": SimpleNamespace(state="first"), "new_state": SimpleNamespace(state="second")})
+        csv = "0,0,0,645,0,0,1795478400,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0"
+        self.hass.states.set("sensor.result_csv", csv)
+        with patch.object(runtime.protocol, "send_event") as send:
+            runtime._process_event_sources(event)
+            send.assert_called_once_with("8.e.2", {"8.1": csv})
+            send.reset_mock()
+            self.hass.states.set("sensor.result_csv", "unavailable")
+            runtime._process_event_sources(event)
+            send.assert_not_called()
+        self.assertIn("sensor.result_csv", runtime._source_entities())
+
+    async def test_unavailable_action_output_is_not_replaced_by_full_battery(self):
+        runtime = self.model_runtime("yunmai.scales.ms103")
+        runtime.property_mappings["13.10"] = {"source": "entity", "entity_id": "sensor.battery_status"}
+        self.hass.states.set("sensor.battery_status", "unavailable")
+        runtime.sync_sources()
+        result, outputs = await runtime._async_action(SimpleNamespace(action_key="13.1", args=()))
+        self.assertEqual((result, outputs), (1, {}))
+        self.assertNotIn("virtual_values", runtime._document)
+
+
+class ModelConnectionTests(BridgeTestCase):
+    async def test_bound_night_light_uses_the_upstream_discovery_shape_and_name(self):
+        runtime = self.model_runtime("MUE4094RT")
+        runtime.instance = 1
+        identity = runtime.protocol.identity
+        await self.manager._async_publish(runtime, 100)
+        self.assertEqual(runtime.protocol.hello(0)[11], 0x09)
+        self.assertIn(runtime.protocol.hello(0), self.manager.advertiser.data[0][1])
+        self.assertIn(b"MUE4094RT", bridge.scan_response_payload(runtime, 0))
+        self.assertEqual(runtime.protocol.identity, identity)
+        self.assertEqual(runtime.counter.next_counter, 0)
+
+    async def test_control_models_rotate_but_a_connected_model_keeps_ownership(self):
+        first = self.model_runtime("careco.nlight.o654", entry_id="first")
+        second = self.model_runtime("xiaomi.cooler.r02p", entry_id="second", mac="D4:3B:04:5E:2A:11")
+        first.instance, second.instance = 1, 2
+        self.manager.targets = {first.device_id: first, second.device_id: second}
+        await self.manager._async_select_connection(0)
+        self.assertIs(self.manager.connection_target, first)
+        await self.manager._async_select_connection(3.1)
+        self.assertIs(self.manager.connection_target, second)
+        await self.manager._async_process_hci_event(second, bridge.BluetoothEvent("connected", instance=2, handle=0x123, role=1, status=0))
+        await self.manager._async_select_connection(20)
+        self.assertIs(self.manager.connection_target, second)
+        self.assertTrue(second.protocol._connected)
+        self.assertFalse(first.protocol._connected)
+
+    async def test_explicit_pairing_preempts_control_without_erasing_binding(self):
+        control = self.model_runtime("careco.nlight.o654")
+        control.instance = 1
+        radar = self.runtime(bound=True)
+        radar.instance = 2
+        radar.sync_sources()
+        self.manager.targets = {control.device_id: control, radar.device_id: radar}
+        await self.manager._async_select_connection(0)
+        await self.manager.async_start_pairing(radar)
+        self.assertIsNone(self.manager.connection_target)
+        self.assertIs(self.manager.pairing, radar)
+        self.assertTrue(control.bound)
+        self.assertTrue(radar.bound)
+        await self.manager._async_select_connection(100)
+        self.assertIsNone(self.manager.connection_target)
+
+    async def test_larger_single_object_advertisement_still_fits_31_bytes(self):
+        payload = bytes(range(21))
+        packet = bridge.advertising_payload(payload)
+        self.assertLessEqual(len(packet), 31)
+        self.assertIn(b"\x16\x95\xfe"+payload, packet)
+        with self.assertRaises(ValueError):
+            bridge.advertising_payload(bytes(25))
 
 
 class NotificationTests(BridgeTestCase):

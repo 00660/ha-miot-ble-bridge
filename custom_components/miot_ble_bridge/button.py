@@ -6,7 +6,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, MANUFACTURER, MODEL
+from .const import DOMAIN, MANUFACTURER
 
 
 async def async_setup_entry(
@@ -42,7 +42,7 @@ class MiotPairingButton(ButtonEntity):
             identifiers={(DOMAIN, entry.entry_id)},
             name=self._runtime.name,
             manufacturer=MANUFACTURER,
-            model=MODEL,
+            model=self._runtime.model.model,
         )
 
     async def async_added_to_hass(self) -> None:
