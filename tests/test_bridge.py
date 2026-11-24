@@ -113,7 +113,7 @@ class FakeEntry:
 
 class FakeAdvertiser:
     def __init__(self):
-        self.capabilities = SimpleNamespace(usable_instances=tuple(range(1, 16)))
+        self.usable_instances = tuple(range(1, 16))
         self.configured = []
         self.disabled = []
         self.enabled = []
@@ -150,6 +150,7 @@ class FakeServer:
         self.start_error = None
         self.disconnect_error = None
         self.notifications = []
+        self.disconnected = []
         self.accept = True
         self.reset_count = 0
 
@@ -161,7 +162,11 @@ class FakeServer:
     async def async_stop(self):
         self.stopped = True
 
+    async def async_check_legacy_occupancy(self, *, busy=None):
+        return busy is None or not busy()
+
     async def async_disconnect_peer(self, address):
+        self.disconnected.append(address)
         if self.disconnect_error:
             raise self.disconnect_error
 
@@ -173,6 +178,51 @@ class FakeServer:
             return False
         self.notifications.append((channel, value))
         return True
+
+
+class FakeLegacyAdvertiser(bridge.LegacyAdvertiser):
+    """Run legacy ownership rules and replace only the controller transport."""
+
+    def __init__(self, event_callback):
+        super().__init__(event_callback=event_callback)
+        self.configured = []
+        self.disabled = []
+        self.enabled = []
+        self.data = []
+        self.commands = []
+        self.command_hook = None
+        self.configure_hook = None
+        self.stopped = False
+
+    async def _command(self, opcode, payload=b"", *args, **kwargs):
+        self.commands.append((opcode, payload))
+        if self.command_hook:
+            await self.command_hook(opcode, payload)
+        return b""
+
+    async def async_configure(self, instance, mac, connectable, **kwargs):
+        self.configured.append((instance, mac, connectable))
+        await super().async_configure(instance, mac, connectable, **kwargs)
+        if self.configure_hook:
+            await self.configure_hook(instance)
+
+    async def async_set_data(self, instance, data, scan_response=b""):
+        self.data.append((instance, data))
+        await super().async_set_data(instance, data, scan_response)
+
+    async def async_enable(self, instance):
+        enabled = await super().async_enable(instance)
+        if enabled:
+            self.enabled.append(instance)
+        return enabled
+
+    async def async_disable(self, instance):
+        self.disabled.append(instance)
+        await super().async_disable(instance)
+
+    async def async_stop(self):
+        self.stopped = True
+        await super().async_stop()
 
 
 class BridgeTestCase(unittest.IsolatedAsyncioTestCase):
@@ -635,6 +685,167 @@ class ModelConnectionTests(BridgeTestCase):
         with self.assertRaises(ValueError):
             bridge.advertising_payload(bytes(25))
 
+    async def test_legacy_rotation_waits_for_pairing_and_resumes_after_disconnect(self):
+        first = self.model_runtime("MUE4094RT", entry_id="first")
+        second = self.model_runtime("MUE4094RT", entry_id="second", mac="D4:3B:04:5E:2A:11")
+        first.instance, second.instance = 1, 2
+        self.manager.targets = {first.device_id: first, second.device_id: second}
+
+        with patch.object(bridge.time, "monotonic", return_value=100):
+            await self.manager._async_publish_legacy(100)
+        await self.manager._async_publish_legacy(101)
+        self.assertEqual(self.manager.advertiser.enabled, [1])
+        with patch.object(bridge.time, "monotonic", return_value=104):
+            await self.manager._async_publish_legacy(104)
+            await self.manager.async_start_pairing(first)
+        self.assertEqual(self.manager.advertiser.enabled, [1, 2, 1])
+        await self.manager._async_process_hci_event(
+            first, bridge.BluetoothEvent("connected", instance=1, handle=0x123, role=1, status=0),
+        )
+        await self.manager._async_publish_legacy(110)
+        self.assertEqual(self.manager.advertiser.enabled, [1, 2, 1])
+        await self.manager._async_process_hci_event(
+            first, bridge.BluetoothEvent("disconnected", instance=1, handle=0x123, status=0),
+        )
+        await self.manager._async_publish_legacy(111)
+        self.assertEqual(self.manager.advertiser.enabled, [1, 2, 1, 1])
+
+    async def test_legacy_late_connections_during_rotation_pin_the_original_identity(self):
+        for stage in ("counter", "disable", "configure", "occupancy"):
+            with self.subTest(stage=stage):
+                first = self.model_runtime("miaomiaoce.sensor_ht.t2", entry_id="first")
+                second = self.model_runtime("miaomiaoce.sensor_ht.t2", entry_id="second", mac="D4:3B:04:5E:2A:11")
+                first.instance, second.instance = 1, 2
+                self.manager.targets = {first.device_id: first, second.device_id: second}
+                self.manager._legacy_target = first
+                self.manager.connection_target = first
+                self.manager._connection_owner = None
+                self.manager.connection_handle = None
+                self.manager._incoming_pending = False
+                self.manager._selection_deadline = 0
+                self.manager.advertiser = FakeLegacyAdvertiser(self.manager._hci_event)
+                advertiser = self.manager.advertiser
+                await advertiser.async_configure(first.instance, first.mac, True)
+                await advertiser.async_set_data(first.instance, b"first", b"")
+                await advertiser.async_enable(first.instance)
+                first._enabled = True
+                before = len(advertiser.commands)
+
+                def connection():
+                    advertiser._dispatch_event(bridge.BluetoothEvent("connected", handle=0x123, role=1, status=0))
+
+                if stage == "counter":
+                    original_save = second._async_save
+
+                    async def receive_while_saving(changes):
+                        self.assertEqual(advertiser._enabled, {1})
+                        connection()
+                        await original_save(changes)
+
+                    second._async_save = receive_while_saving
+                elif stage == "disable":
+                    async def receive_while_disabling(opcode, payload):
+                        if opcode == 0x200A and payload == b"\x00":
+                            advertiser.command_hook = None
+                            connection()
+
+                    advertiser.command_hook = receive_while_disabling
+                elif stage == "configure":
+                    async def receive_while_configuring(instance):
+                        if instance == 2:
+                            connection()
+
+                    advertiser.configure_hook = receive_while_configuring
+                else:
+                    checks = 0
+
+                    async def receive_before_enabling(*, busy=None):
+                        nonlocal checks
+                        checks += 1
+                        if checks == 2:
+                            connection()
+                        return busy is None or not busy()
+
+                    self.manager.server.async_check_legacy_occupancy = receive_before_enabling
+
+                async with self.manager._operation_lock:
+                    await self.manager._async_publish_legacy(100)
+                    self.assertIs(self.manager._connection_owner, first)
+                    self.assertIs(self.manager._current_runtime(), first)
+                    self.assertTrue(self.manager._incoming_pending)
+                    self.assertEqual(advertiser.enabled, [1])
+                    self.assertNotIn((0x2005, bytes.fromhex("112a5e043bd4")), advertiser.commands[before:])
+                await asyncio.gather(*tuple(self.manager._event_tasks))
+                self.assertEqual(self.manager.connection_handle, 0x123)
+                self.assertIs(self.manager._connection_owner, first)
+                if stage == "counter":
+                    self.assertEqual(second.counter.next_counter, 0)
+                self.manager.pairing = second
+                self.manager._pair_deadline = 1000
+                first.protocol.read = Mock(return_value=b"old connection")
+                second.protocol.read = Mock(return_value=b"new pairing")
+                self.assertEqual(self.manager._read_gatt(0x0013), b"old connection")
+                await self.manager._async_publish_legacy(101)
+                self.assertEqual(advertiser.enabled, [1])
+                advertiser._dispatch_event(bridge.BluetoothEvent("disconnected", handle=0x456, status=0))
+                self.assertIs(self.manager._connection_owner, first)
+                advertiser._dispatch_event(bridge.BluetoothEvent("disconnected", handle=0x123, status=0))
+                await asyncio.gather(*tuple(self.manager._event_tasks))
+                self.assertIsNone(self.manager._connection_owner)
+                self.assertIs(self.manager._current_runtime(), second)
+                self.manager.pairing = None
+                self.manager.server.async_check_legacy_occupancy = AsyncMock(return_value=True)
+                await advertiser.async_stop()
+
+    async def test_connection_received_while_preparing_data_preserves_queued_events(self):
+        first = self.model_runtime("miaomiaoce.sensor_ht.t2", entry_id="first")
+        second = self.model_runtime("miaomiaoce.sensor_ht.t2", entry_id="second", mac="D4:3B:04:5E:2A:11")
+        first.instance, second.instance = 1, 2
+        self.manager.targets = {first.device_id: first, second.device_id: second}
+        self.manager._legacy_target = first
+        self.manager.connection_target = first
+        self.manager._selection_deadline = 0
+        advertiser = FakeLegacyAdvertiser(self.manager._hci_event)
+        self.manager.advertiser = advertiser
+        await advertiser.async_configure(first.instance, first.mac, True)
+        await advertiser.async_set_data(first.instance, b"first", b"")
+        await advertiser.async_enable(first.instance)
+        first._enabled = True
+        event = (0x100A, b"\x64")
+        second._event_objects.append(event)
+        original_set = advertiser.async_set_data
+
+        async def receive_while_setting_data(instance, data, scan_response=b""):
+            await original_set(instance, data, scan_response)
+            if instance == 2:
+                advertiser._dispatch_event(bridge.BluetoothEvent("connected", handle=0x123, role=1, status=0))
+
+        advertiser.async_set_data = receive_while_setting_data
+        async with self.manager._operation_lock:
+            await self.manager._async_publish_legacy(100)
+            self.assertIs(self.manager._current_runtime(), first)
+            self.assertEqual(advertiser.enabled, [1])
+            self.assertEqual(list(second._event_objects), [event])
+        await asyncio.gather(*tuple(self.manager._event_tasks))
+
+    async def test_only_unsupported_vendor_advertising_selects_legacy(self):
+        original = self.manager.advertiser
+        original.async_start = AsyncMock()
+        self.manager.server.async_require_idle_advertising = AsyncMock()
+        with patch.object(bridge.LegacyAdvertiser, "async_start", new_callable=AsyncMock) as start:
+            await self.manager._async_start_bluetooth()
+            self.assertIs(self.manager.advertiser, original)
+            start.assert_not_awaited()
+            original.async_start.side_effect = bridge.HciError("timed out")
+            with self.assertRaises(bridge.HciError):
+                await self.manager._async_start_bluetooth()
+            start.assert_not_awaited()
+            original.async_start.side_effect = bridge.HciUnsupportedError("no vendor instances")
+            await self.manager._async_start_bluetooth()
+            self.assertEqual(self.manager.advertising_mode, "legacy_rotation")
+            self.manager.server.async_require_idle_advertising.assert_awaited_once_with(self.hass)
+            start.assert_awaited_once()
+
 
 class NotificationTests(BridgeTestCase):
     async def test_backpressure_preserves_queue_head_and_order(self):
@@ -690,6 +901,125 @@ class LifecycleTests(BridgeTestCase):
         self.assertTrue(self.manager.advertiser.stopped)
         self.assertTrue(self.manager.server.stopped)
         self.assertFalse(self.manager._event_tasks)
+
+    async def test_pending_legacy_connection_can_be_closed_before_event_task_runs(self):
+        address = "11:22:33:44:55:66"
+        for action in ("end_pairing", "remove"):
+            with self.subTest(action=action):
+                runtime = self.model_runtime("miaomiaoce.sensor_ht.t2")
+                runtime.instance = 1
+                self.manager.targets = {runtime.device_id: runtime}
+                self.manager.connection_target = runtime
+                self.manager._legacy_target = runtime
+                self.manager.pairing = runtime if action == "end_pairing" else None
+                advertiser = FakeLegacyAdvertiser(self.manager._hci_event)
+                self.manager.advertiser = advertiser
+                await advertiser.async_configure(1, runtime.mac, True)
+                await advertiser.async_set_data(1, b"first", b"")
+                await advertiser.async_enable(1)
+                runtime._enabled = True
+                identity = dict(runtime.protocol.identity)
+
+                async with self.manager._operation_lock:
+                    cleanup = asyncio.create_task(
+                        self.manager.async_end_pairing() if action == "end_pairing"
+                        else self.manager.async_remove(runtime)
+                    )
+                    await asyncio.sleep(0)
+                    advertiser._dispatch_event(bridge.BluetoothEvent(
+                        "connected", handle=0x123, role=1, status=0, address=address,
+                    ))
+                    self.assertTrue(self.manager._incoming_pending)
+                    self.assertEqual(self.manager._peer_address, address)
+                await cleanup
+                await asyncio.gather(*tuple(self.manager._event_tasks))
+                self.assertEqual(self.manager.server.disconnected[-1], address)
+                self.assertIs(self.manager._connection_owner, runtime)
+                self.assertIs(self.manager._current_runtime(), runtime)
+                self.assertEqual(runtime.protocol.identity, identity)
+                self.assertIsNone(self.manager.failure)
+                if action == "remove":
+                    self.assertNotIn(runtime.device_id, self.manager.targets)
+
+                advertiser._dispatch_event(bridge.BluetoothEvent("disconnected", handle=0x123, status=0))
+                await asyncio.gather(*tuple(self.manager._event_tasks))
+                self.assertIsNone(self.manager._connection_owner)
+                self.assertIsNone(self.manager.connection_handle)
+                await advertiser.async_stop()
+
+    async def test_transport_failure_during_legacy_connection_enters_recovery(self):
+        runtime = self.model_runtime("miaomiaoce.sensor_ht.t2")
+        runtime.instance = 1
+        self.manager.targets = {runtime.device_id: runtime}
+        self.manager.connection_target = runtime
+        self.manager._legacy_target = runtime
+        advertiser = FakeLegacyAdvertiser(self.manager._hci_event)
+        self.manager.advertiser = advertiser
+        server = self.manager.server
+        await advertiser.async_configure(1, runtime.mac, True)
+        await advertiser.async_set_data(1, b"first", b"")
+        await advertiser.async_enable(1)
+        advertiser._dispatch_event(bridge.BluetoothEvent(
+            "connected", handle=0x123, role=1, status=0, address="11:22:33:44:55:66",
+        ))
+        await asyncio.gather(*tuple(self.manager._event_tasks))
+        identity = dict(runtime.protocol.identity)
+        mac = runtime.mac
+        advertiser._fail(bridge.HciError("Injected USB removal"))
+        failed = asyncio.Event()
+        recovered = asyncio.Event()
+        order = []
+        original_failed = self.manager._failed
+        original_recover = self.manager._async_recover
+        original_stop_advertiser = advertiser.async_stop
+        original_disconnect = server.async_disconnect_peer
+        original_stop_server = server.async_stop
+
+        def record_failure(error):
+            original_failed(error)
+            failed.set()
+
+        async def record_recovery():
+            await original_recover()
+            recovered.set()
+
+        async def stop_advertiser():
+            order.append("advertiser")
+            await original_stop_advertiser()
+
+        async def disconnect_peer(address):
+            order.append("peer")
+            await original_disconnect(address)
+
+        async def stop_server():
+            order.append("server")
+            await original_stop_server()
+
+        advertiser.async_stop = stop_advertiser
+        server.async_disconnect_peer = disconnect_peer
+        server.async_stop = stop_server
+        replacement = FakeAdvertiser()
+        replacement_server = FakeServer()
+        with patch.object(bridge, "VendorAdvertiser", return_value=replacement), \
+                patch.object(bridge, "BlueZServer", return_value=replacement_server), \
+                patch.object(self.manager, "_failed", side_effect=record_failure), \
+                patch.object(self.manager, "_async_recover", side_effect=record_recovery):
+            self.manager._task = asyncio.create_task(self.manager._run())
+            await asyncio.wait_for(failed.wait(), 1)
+            self.assertIn("Injected USB removal", self.manager.failure)
+            self.manager._retry_at = 0
+            self.manager.wakeup.set()
+            await asyncio.wait_for(recovered.wait(), 1)
+        self.assertEqual(order, ["advertiser", "peer", "server"])
+        self.assertEqual(server.disconnected, ["11:22:33:44:55:66"])
+        self.assertIs(self.manager.advertiser, replacement)
+        self.assertTrue(replacement.started)
+        self.assertTrue(replacement_server.started)
+        self.assertIsNone(self.manager.failure)
+        self.assertIsNone(self.manager._connection_owner)
+        self.assertIsNone(self.manager.connection_handle)
+        self.assertEqual(runtime.mac, mac)
+        self.assertEqual(runtime.protocol.identity, identity)
 
     async def test_remove_cleans_target_and_subscriptions_when_disable_fails(self):
         runtime = self.runtime()

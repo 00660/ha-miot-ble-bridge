@@ -5,7 +5,9 @@ import importlib.util
 from pathlib import Path
 import struct
 import sys
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 MODULE_PATH = Path(__file__).parents[1] / "custom_components" / "miot_ble_bridge" / "hci.py"
 SPEC = importlib.util.spec_from_file_location("miot_bridge_hci_under_test", MODULE_PATH)
@@ -23,6 +25,11 @@ def complete(opcode, status=0, data=b""):
 
 def vendor_event(instance, state, handle):
     return bytes((4, 0xFF, 5, 0x55, instance, state)) + struct.pack("<H", handle)
+
+
+def connection_event(handle):
+    body = struct.pack("<BBHBB6sHHHB", 1, 0, handle, 1, 0, bytes.fromhex("665544332211"), 24, 0, 500, 0)
+    return bytes((4, 0x3E, len(body))) + body
 
 
 class FakeSocket:
@@ -58,6 +65,213 @@ class SimulatedAdvertiser(hci.VendorAdvertiser):
             else:
                 response = complete(opcode, data=packet[4:5])
             self.incoming.put_nowait(response)
+
+
+class SimulatedLegacyAdvertiser(SimulatedAdvertiser, hci.LegacyAdvertiser):
+    pass
+
+
+class LegacyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_recent_connectable_identity_owns_a_late_connection_until_disconnect(self):
+        events = []
+        controller = SimulatedLegacyAdvertiser(event_callback=events.append)
+        await controller.async_start()
+        try:
+            await controller.async_configure(1, "D4:3B:04:5E:2A:10", True)
+            await controller.async_configure(2, "D4:3B:04:5E:2A:11", True)
+            await controller.async_set_data(1, b"first", b"")
+            await controller.async_set_data(2, b"second", b"")
+            await controller.async_enable(1)
+            await controller.async_disable(1)
+            before = len(controller.sent)
+            controller._dispatch_event(hci.BluetoothEvent("connected", handle=101, role=1, status=0))
+            self.assertEqual(events[0].instance, 1)
+            self.assertFalse(await controller.async_enable(2))
+            self.assertEqual(len(controller.sent), before)
+            controller._dispatch_event(hci.BluetoothEvent("connected", handle=102, role=1, status=0))
+            controller._dispatch_event(hci.BluetoothEvent("disconnected", handle=101, status=1))
+            controller._dispatch_event(hci.BluetoothEvent("disconnected", handle=102, status=0))
+            self.assertEqual(len(events), 1)
+            self.assertFalse(await controller.async_enable(2))
+            controller._dispatch_event(hci.BluetoothEvent("disconnected", handle=101, status=0))
+            self.assertEqual([event.instance for event in events], [1, 1])
+            self.assertTrue(await controller.async_enable(2))
+        finally:
+            await controller.async_stop()
+
+    async def test_unknown_and_expired_connection_events_do_not_claim_an_identity(self):
+        events = []
+        controller = SimulatedLegacyAdvertiser(event_callback=events.append)
+        await controller.async_start()
+        try:
+            await controller.async_configure(1, "D4:3B:04:5E:2A:10", True)
+            await controller.async_set_data(1, b"first", b"")
+            controller._dispatch_event(hci.BluetoothEvent("connected", handle=100, role=1, status=0))
+            self.assertEqual(events, [])
+            await controller.async_enable(1)
+            with patch.object(hci, "time", SimpleNamespace(monotonic=lambda: 0)):
+                await controller.async_disable(1)
+            controller._dispatch_event(hci.BluetoothEvent("connected", handle=100, role=1, status=0))
+            self.assertEqual(events, [])
+            await controller.async_enable(1)
+            for event in (
+                hci.BluetoothEvent("connected", handle=101, role=0, status=0),
+                hci.BluetoothEvent("connected", handle=101, role=1, status=1),
+                hci.BluetoothEvent("connected", handle=0xFFFF, role=1, status=0),
+                hci.BluetoothEvent("connected", handle=101, instance=99, role=1, status=0),
+            ):
+                controller._dispatch_event(event)
+            self.assertEqual(events, [])
+        finally:
+            await controller.async_stop()
+
+    async def test_late_connection_during_new_advertising_setup_prevents_enable(self):
+        for stop_opcode in (0x2005, 0x2006, 0x2008, 0x2009):
+            with self.subTest(opcode=stop_opcode):
+                events = []
+                controller = SimulatedLegacyAdvertiser(event_callback=events.append)
+                await controller.async_start()
+                try:
+                    await controller.async_configure(1, "D4:3B:04:5E:2A:10", True)
+                    await controller.async_configure(2, "D4:3B:04:5E:2A:11", True)
+                    await controller.async_set_data(1, b"first", b"")
+                    await controller.async_set_data(2, b"second", b"")
+                    await controller.async_enable(1)
+                    await controller.async_disable(1)
+                    before = len(controller.sent)
+                    original_send = controller._async_send
+
+                    async def receive_connection(packet):
+                        await original_send(packet)
+                        if struct.unpack_from("<H", packet, 1)[0] == stop_opcode:
+                            controller._dispatch_event(hci.BluetoothEvent("connected", handle=101, role=1, status=0))
+
+                    controller._async_send = receive_connection
+                    self.assertFalse(await controller.async_enable(2))
+                    self.assertEqual(events[0].instance, 1)
+                    sent = controller.sent[before:]
+                    self.assertEqual(struct.unpack_from("<H", sent[-1], 1)[0], stop_opcode)
+                    self.assertNotIn((0x200A, b"\x01"), [(struct.unpack_from("<H", packet, 1)[0], packet[4:]) for packet in sent])
+                finally:
+                    await controller.async_stop()
+
+    async def test_previous_connection_before_enable_reply_freezes_rotation(self):
+        for status in (0, 0x0C):
+            with self.subTest(status=status):
+                events = []
+                controller = SimulatedLegacyAdvertiser(event_callback=events.append)
+                await controller.async_start()
+                try:
+                    await controller.async_configure(1, "D4:3B:04:5E:2A:10", True)
+                    await controller.async_configure(2, "D4:3B:04:5E:2A:11", True)
+                    await controller.async_set_data(1, b"first", b"")
+                    await controller.async_set_data(2, b"second", b"")
+                    await controller.async_enable(1)
+                    await controller.async_disable(1)
+                    original_send = controller._async_send
+
+                    async def connection_before_reply(packet):
+                        if struct.unpack_from("<H", packet, 1)[0] == 0x200A and packet[4:] == b"\x01":
+                            controller.sent.append(packet)
+                            controller.incoming.put_nowait(connection_event(101))
+                            controller.incoming.put_nowait(complete(0x200A, status=status))
+                        else:
+                            await original_send(packet)
+
+                    controller._async_send = connection_before_reply
+                    self.assertFalse(await controller.async_enable(2))
+                    self.assertEqual(controller._handle_instances, {101: 1})
+                    self.assertEqual([event.instance for event in events], [1])
+                    self.assertEqual(controller._enabled, set())
+                    if status == 0:
+                        self.assertEqual(controller.sent[-1][4:], b"\x00")
+                    self.assertIsNone(controller.failure)
+                finally:
+                    await controller.async_stop()
+
+    async def test_connection_after_enable_reply_uses_new_identity_before_worker_resumes(self):
+        events = []
+        controller = SimulatedLegacyAdvertiser(event_callback=events.append)
+        await controller.async_start()
+        try:
+            await controller.async_configure(1, "D4:3B:04:5E:2A:10", True)
+            await controller.async_configure(2, "D4:3B:04:5E:2A:11", True)
+            await controller.async_set_data(1, b"first", b"")
+            await controller.async_set_data(2, b"second", b"")
+            await controller.async_enable(1)
+            await controller.async_disable(1)
+            original_send = controller._async_send
+
+            async def connection_after_reply(packet):
+                await original_send(packet)
+                if struct.unpack_from("<H", packet, 1)[0] == 0x200A and packet[4:] == b"\x01":
+                    controller.incoming.put_nowait(connection_event(102))
+
+            controller._async_send = connection_after_reply
+            self.assertFalse(await controller.async_enable(2))
+            self.assertEqual(controller._handle_instances, {102: 2})
+            self.assertEqual([event.instance for event in events], [2])
+            self.assertIsNone(controller.failure)
+        finally:
+            await controller.async_stop()
+
+    async def test_enable_rejection_without_owned_connection_is_not_hidden(self):
+        controller = SimulatedLegacyAdvertiser()
+        await controller.async_start()
+        try:
+            await controller.async_configure(1, "D4:3B:04:5E:2A:10", True)
+            await controller.async_set_data(1, b"first", b"")
+            original_send = controller._async_send
+
+            async def reject_enable(packet):
+                if struct.unpack_from("<H", packet, 1)[0] == 0x200A and packet[4:] == b"\x01":
+                    controller.sent.append(packet)
+                    controller.incoming.put_nowait(complete(0x200A, status=0x0C))
+                else:
+                    await original_send(packet)
+
+            controller._async_send = reject_enable
+            with self.assertRaises(hci.HciCommandError):
+                await controller.async_enable(1)
+            self.assertEqual(controller._enabled, set())
+            self.assertIsNone(controller.failure)
+        finally:
+            await controller.async_stop()
+
+    async def test_switches_addresses_only_with_advertising_disabled(self):
+        events = []
+        controller = SimulatedLegacyAdvertiser(event_callback=events.append)
+        await controller.async_start()
+        try:
+            await controller.async_configure(1, "D4:3B:04:5E:2A:10", False)
+            await controller.async_configure(2, "D4:3B:04:5E:2A:11", True)
+            await controller.async_set_data(1, b"first", b"scan first")
+            await controller.async_set_data(2, b"second", b"scan second")
+            await controller.async_enable(1)
+            central = hci.BluetoothEvent("connected", handle=100, role=0, status=0)
+            peripheral = hci.BluetoothEvent("connected", handle=101, role=1, status=0)
+            controller._dispatch_event(central)
+            controller._dispatch_event(peripheral)
+            self.assertEqual(events, [])
+            with self.assertRaises(hci.HciError):
+                await controller.async_enable(2)
+            await controller.async_disable(1)
+            await controller.async_enable(2)
+            controller._dispatch_event(peripheral)
+            controller._dispatch_event(hci.BluetoothEvent("disconnected", handle=101, status=0))
+            self.assertEqual([event.instance for event in events], [2, 2])
+        finally:
+            await controller.async_stop()
+
+        commands = [(struct.unpack_from("<H", packet, 1)[0], packet[4:]) for packet in controller.sent]
+        opcodes, payloads = zip(*commands)
+        sequence = (0x200A, 0x2005, 0x2006, 0x2008, 0x2009, 0x200A)
+        self.assertEqual(opcodes, sequence * 2 + (0x200A,))
+        self.assertEqual(payloads[1], bytes.fromhex("102a5e043bd4"))
+        self.assertEqual(payloads[7], bytes.fromhex("112a5e043bd4"))
+        self.assertEqual(payloads[2][4:6], b"\x02\x01")
+        self.assertEqual(payloads[8][4:6], b"\x00\x01")
+        self.assertEqual(payloads[-1], b"\x00")
 
 
 class PacketTests(unittest.TestCase):
