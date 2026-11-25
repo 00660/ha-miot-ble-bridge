@@ -416,7 +416,8 @@ class RadarRuntime:
                     payload = definition.encode({**snapshot, **arguments})
                     if len(payload) > 9:
                         raise ValueError("Event object exceeds the advertising capacity")
-                    for _ in range(3):
+                    legacy_burst = isinstance(self.manager.advertiser, LegacyAdvertiser) and not self.model.connectable
+                    for _ in range(1 if legacy_burst else 3):
                         self._event_objects.append((definition.beacon_id, payload))
                     self._next_publication = 0.0
                 self.manager.wakeup.set()
@@ -750,17 +751,19 @@ class BridgeManager:
             await self._async_publish(self.pairing, now)
             return
 
-        candidates = [
+        available = [
             target for target in self.targets.values()
             if target.bound and target._source_available and not target._error
         ]
         previous = self._legacy_target
-        if previous in candidates and now < self._selection_deadline:
+        if previous in available and now < self._selection_deadline:
             return
-        if previous in candidates:
-            selected = candidates[(candidates.index(previous) + 1) % len(candidates)]
-        else:
-            selected = candidates[0] if candidates else None
+        last_slot = previous.instance if previous is not None else 0
+        selected = min(
+            (target for target in available if target.model.connectable or target._event_objects or target._pending_objects),
+            key=lambda target: (target.instance <= last_slot, target.instance),
+            default=None,
+        )
         if selected is not None:
             if not await self._async_prepare_legacy_counter(selected):
                 return
@@ -790,7 +793,7 @@ class BridgeManager:
         self._legacy_target = selected
         self.connection_target = selected if selected.model.connectable else None
         selected._next_publication = 0.0
-        await self._async_publish(selected, now)
+        await self._async_publish(selected, now, queued_only=not selected.model.connectable)
         self._selection_deadline = time.monotonic() + (3.0 if selected.model.connectable else _LEGACY_DWELL)
 
     def _legacy_connection_busy(self) -> bool:
@@ -1003,7 +1006,7 @@ class BridgeManager:
                 break
             self._notifications.popleft()
 
-    async def _async_publish(self, runtime: RadarRuntime, now: float) -> None:
+    async def _async_publish(self, runtime: RadarRuntime, now: float, *, queued_only: bool = False) -> None:
         if runtime._error:
             return
         legacy = isinstance(self.advertiser, LegacyAdvertiser)
@@ -1030,15 +1033,14 @@ class BridgeManager:
             runtime._hello_sequence = (runtime._hello_sequence + 1) & 0xFF
         else:
             if runtime._event_objects:
-                object_id, object_payload = runtime._event_objects.popleft()
-                queued_event = (object_id, object_payload)
+                queued_event = runtime._event_objects[0]
+                object_id, object_payload = queued_event
             elif runtime._pending_objects:
-                object_id = runtime._pending_objects.popleft()
-                queued_property = object_id
+                queued_property = object_id = runtime._pending_objects[0]
                 object_payload = runtime._object_payloads[object_id]
             else:
                 objects = list(runtime._objects)
-                if not objects:
+                if queued_only or not objects:
                     return
                 object_id = objects[runtime._rotation % len(objects)]
                 runtime._rotation += 1
@@ -1056,28 +1058,27 @@ class BridgeManager:
         await self.advertiser.async_set_data(
             runtime.instance, advertising_payload(service_data), scan_response_payload(runtime, counter),
         )
-        def defer_publication() -> None:
-            if queued_event is not None:
-                runtime._event_objects.appendleft(queued_event)
-            elif queued_property is not None and queued_property not in runtime._pending_objects:
-                runtime._pending_objects.appendleft(queued_property)
-
         if legacy and self._legacy_connection_busy():
-            defer_publication()
             return
         if not runtime._enabled:
             if legacy:
                 if not await self.server.async_check_legacy_occupancy(busy=self._legacy_connection_busy):
-                    defer_publication()
                     return
                 if self._legacy_connection_busy():
-                    defer_publication()
                     return
             enabled = await self.advertiser.async_enable(runtime.instance)
             if legacy and (enabled is False or self._legacy_connection_busy()):
-                defer_publication()
                 return
             runtime._enabled = True
+        # Source callbacks can replace queued data while HCI commands are in flight.
+        if queued_event is not None and runtime._event_objects and runtime._event_objects[0] is queued_event:
+            runtime._event_objects.popleft()
+        if (
+            queued_property is not None
+            and queued_property in runtime._pending_objects
+            and runtime._object_payloads.get(queued_property) == object_payload
+        ):
+            runtime._pending_objects.remove(queued_property)
         runtime._next_publication = now + (0.4 if runtime._event_objects else 0.5 if runtime._pending_objects else 1.0)
         runtime._last_broadcast = datetime.now(timezone.utc).isoformat()
 
@@ -1119,12 +1120,15 @@ class BridgeManager:
                 runtime.protocol.disconnect()
                 await self.advertiser.async_configure(runtime.instance, runtime.mac, False, interval_ms=400)
                 runtime._next_publication = 0.0
+                if isinstance(self.advertiser, LegacyAdvertiser) and not runtime.model.connectable:
+                    runtime._pending_objects.extend(key for key in runtime._objects if key not in runtime._pending_objects)
             self.failure = None
             for runtime in self.targets.values():
                 runtime.notify_listeners()
 
     async def _run(self) -> None:
         while not self._stopping:
+            self.wakeup.clear()
             try:
                 now = time.monotonic()
                 if self.failure is None and (error := getattr(self.advertiser, "failure", None)) is not None:
@@ -1152,7 +1156,6 @@ class BridgeManager:
                             await self._async_publish_legacy(now)
             except (HciError, OSError, DBusError, ProtocolError, RuntimeError, ValueError) as error:
                 self._failed(error)
-            self.wakeup.clear()
             try:
                 await asyncio.wait_for(self.wakeup.wait(), 0.05 if self.connection_handle is not None else 0.2)
             except TimeoutError:

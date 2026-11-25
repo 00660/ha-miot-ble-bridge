@@ -471,6 +471,16 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(controller._reader)
         self.assertIsNone(controller._worker)
 
+    async def test_unanswered_vendor_probe_is_reported_as_unsupported(self):
+        controller = SimulatedAdvertiser(command_timeout=0.02)
+        controller.automatic = False
+        with self.assertRaises(hci.HciUnsupportedError) as result:
+            await controller.async_start()
+        self.assertIsInstance(result.exception.__cause__, hci.HciCommandTimeout)
+        self.assertTrue(controller.fake_socket.closed)
+        self.assertIsNone(controller._reader)
+        self.assertIsNone(controller._worker)
+
 
 if __name__ == "__main__":
     unittest.main()

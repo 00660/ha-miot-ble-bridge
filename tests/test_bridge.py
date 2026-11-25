@@ -710,6 +710,59 @@ class ModelConnectionTests(BridgeTestCase):
         await self.manager._async_publish_legacy(111)
         self.assertEqual(self.manager.advertiser.enabled, [1, 2, 1, 1])
 
+    async def test_legacy_sensor_sends_changes_and_disables_advertising_when_idle(self):
+        self.manager.advertiser = FakeLegacyAdvertiser(self.manager._hci_event)
+        runtime = self.model_runtime(
+            "xiaomi.sensor_ht.mini",
+            mappings={"2.1001": {"source": "entity", "entity_id": "sensor.temperature"}},
+        )
+        runtime.instance = 1
+        self.manager.targets[runtime.device_id] = runtime
+        self.hass.states.set("sensor.temperature", "20.0")
+        runtime.sync_sources()
+
+        with patch.object(bridge.time, "monotonic", return_value=100) as clock:
+            for now in (100, 102, 104, 106):
+                clock.return_value = now
+                await self.manager._async_publish_legacy(now)
+            self.assertEqual(len(self.manager.advertiser.data), 3)
+            self.assertEqual(self.manager.advertiser.disabled, [1])
+            self.assertFalse(runtime._enabled)
+
+            clock.return_value = 120
+            runtime.sync_sources()
+            await self.manager._async_publish_legacy(120)
+            self.assertEqual(len(self.manager.advertiser.data), 3)
+
+            self.hass.states.set("sensor.temperature", "21.0")
+            runtime.sync_sources()
+            await self.manager._async_publish_legacy(120)
+            self.assertEqual(len(self.manager.advertiser.data), 4)
+            await self.manager._async_publish_legacy(121)
+            self.assertTrue(runtime._enabled)
+            await self.manager._async_publish_legacy(122)
+            self.assertFalse(runtime._enabled)
+            self.assertEqual(self.manager.advertiser.disabled, [1, 1])
+
+    async def test_changed_state_remains_queued_until_controller_accepts_it(self):
+        self.manager.advertiser = FakeLegacyAdvertiser(self.manager._hci_event)
+        runtime = self.model_runtime("xiaomi.sensor_ht.mini")
+        runtime.instance = 1
+        await self.manager.advertiser.async_configure(1, runtime.mac, False)
+        first = runtime._pending_objects[0]
+        with patch.object(self.manager.advertiser, "async_enable", side_effect=bridge.HciError("busy")):
+            with self.assertRaises(bridge.HciError):
+                await self.manager._async_publish(runtime, 100, queued_only=True)
+        self.assertEqual(runtime._pending_objects[0], first)
+
+        async def change_during_write(*args):
+            runtime._source_values["2.1001"] = 27.0
+            runtime.update_properties()
+
+        with patch.object(self.manager.advertiser, "async_set_data", side_effect=change_during_write):
+            await self.manager._async_publish(runtime, 101, queued_only=True)
+        self.assertIn(first, runtime._pending_objects)
+
     async def test_legacy_late_connections_during_rotation_pin_the_original_identity(self):
         for stage in ("counter", "disable", "configure", "occupancy"):
             with self.subTest(stage=stage):
