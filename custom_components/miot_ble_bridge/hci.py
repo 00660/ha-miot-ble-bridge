@@ -44,6 +44,13 @@ class HciQueueFullError(HciError):
     """The bounded command queue is full."""
 
 
+class HciCommandTimeout(HciError):
+    """The controller did not reply to an HCI command."""
+
+    def __init__(self, opcode: int) -> None:
+        super().__init__(f"HCI command 0x{opcode:04X} timed out; transport closed")
+
+
 class HciCommandError(HciError):
     """The controller rejected a command."""
 
@@ -273,6 +280,8 @@ class VendorAdvertiser:
             await self._join_tasks()
             if isinstance(err, HciCommandError) and err.status in (0x01, 0x11):
                 raise HciUnsupportedError("Controller does not implement Android vendor advertising") from err
+            if isinstance(err, HciCommandTimeout):
+                raise HciUnsupportedError("Controller did not reply to the Android vendor advertising probe") from err
             raise
         return self.capabilities
 
@@ -318,7 +327,7 @@ class VendorAdvertiser:
                     await self._async_send(packet)
                     reply = await asyncio.wait_for(self._reply, timeout=self._command_timeout)
                 except TimeoutError:
-                    error = HciError(f"HCI command 0x{command.opcode:04X} timed out; transport closed")
+                    error = HciCommandTimeout(command.opcode)
                     if not command.result.done():
                         command.result.set_exception(error)
                     self._fail(error)
